@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge"
+version = "0.1.0"
+description = "A lightweight, modular coding-agent harness for LLM-based software engineering."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# -----------------------------------------------------------------------
+# Runtime dependencies — kept minimal by design.
+# Each dependency must be justified before adding.
+#
+# python-dotenv:  loads .env file into environment at startup.
+#                 Zero transitive dependencies. Required for developer
+#                 convenience (avoids manually exporting env vars).
+#                 Will NOT add logging frameworks, agent frameworks,
+#                 vector stores, databases, or web frameworks in Step 1.
+# -----------------------------------------------------------------------
+dependencies = [
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+# CLI entry point (implementation deferred to Step 2)
+# forge = "forge.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forge*"]
