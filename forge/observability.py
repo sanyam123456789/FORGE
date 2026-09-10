@@ -96,7 +96,7 @@ class RunTracer:
     Usage
     -----
         tracer = RunTracer(run_id="run_001", task="...")
-        tracer.record_run_start(provider="gemini", model="gemini-2.0-flash", ...)
+        tracer.record_run_start(provider="gemini", model="gemini-3.6-flash", ...)
         tracer.record_llm_request(turn=1, message_count=2, exposed_tools=[...])
         tracer.record_llm_response(input_tokens=500, output_tokens=200, ...)
         tracer.record_tool_call("read_file", args={"path": "foo.py"})

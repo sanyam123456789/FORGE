@@ -21,7 +21,7 @@ class TestDefaultSettings:
 
     def test_default_model(self, clean_env):
         s = load_settings()
-        assert s.llm_model == "gemini-2.0-flash"
+        assert s.llm_model == "gemini-3.6-flash"
 
     def test_default_temperature(self, clean_env):
         s = load_settings()

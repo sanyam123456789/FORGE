@@ -90,7 +90,7 @@ def _usage(**kw):
     return ns
 
 
-def _response(parts, *, finish="STOP", usage=None, model_version="gemini-2.0-flash"):
+def _response(parts, *, finish="STOP", usage=None, model_version="gemini-3.6-flash"):
     candidate = SimpleNamespace(
         finish_reason=_finish(finish),
         content=SimpleNamespace(parts=parts),
@@ -128,7 +128,7 @@ class FakeClient:
 class TestRequestTranslation:
     def test_system_and_user_messages_translated(self):
         client = FakeClient(response=_response([_text_part("hi")]))
-        provider = GeminiProvider(api_key="x", client=client, model="gemini-2.0-flash")
+        provider = GeminiProvider(api_key="x", client=client, model="gemini-3.6-flash")
 
         provider.complete(
             [
@@ -138,7 +138,7 @@ class TestRequestTranslation:
         )
 
         call = client.models.calls[0]
-        assert call["model"] == "gemini-2.0-flash"
+        assert call["model"] == "gemini-3.6-flash"
         # system prompt goes into config.system_instruction, not contents
         assert call["config"].system_instruction == "You are FORGE."
         assert len(call["contents"]) == 1
@@ -209,7 +209,7 @@ class TestResponseTranslation:
         assert resp.content == "hello world"
         assert resp.stop_reason == "stop"
         assert resp.has_tool_calls is False
-        assert resp.model == "gemini-2.0-flash"
+        assert resp.model == "gemini-3.6-flash"
 
     def test_function_call_response(self):
         client = FakeClient(
@@ -360,12 +360,12 @@ class TestApiKeyHandling:
 class TestGetProvider:
     def test_returns_gemini_provider(self):
         settings = SimpleNamespace(
-            llm_provider="gemini", llm_model="gemini-2.0-flash", llm_api_key="k"
+            llm_provider="gemini", llm_model="gemini-3.6-flash", llm_api_key="k"
         )
         provider = get_provider(settings_override=settings)
         assert isinstance(provider, GeminiProvider)
         assert provider.provider_name == "gemini"
-        assert provider.model_name == "gemini-2.0-flash"
+        assert provider.model_name == "gemini-3.6-flash"
 
     def test_unimplemented_provider_raises(self):
         settings = SimpleNamespace(

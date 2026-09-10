@@ -67,7 +67,7 @@ automatically).
 | Variable | Default | Meaning |
 |---|---|---|
 | `FORGE_LLM_PROVIDER` | `gemini` | Provider id. Only `gemini` has an adapter today. |
-| `FORGE_LLM_MODEL` | `gemini-2.0-flash` | Model name passed to the Gemini API. |
+| `FORGE_LLM_MODEL` | `gemini-3.6-flash` | Model name passed to the Gemini API. |
 | `FORGE_LLM_API_KEY` | — | Gemini API key. Falls back to `GEMINI_API_KEY` / `GOOGLE_API_KEY`. |
 | `FORGE_LLM_TEMPERATURE` | `0.0` | Sampling temperature (0.0–2.0). |
 | `FORGE_LLM_MAX_OUTPUT_TOKENS` | `4096` | Max output tokens per call. |

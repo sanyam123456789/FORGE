@@ -53,7 +53,7 @@ class ForgeSettings:
 
     # --- LLM provider ---
     llm_provider: LLMProvider = field(default="gemini")
-    llm_model: str = field(default="gemini-2.0-flash")
+    llm_model: str = field(default="gemini-3.6-flash")
     llm_api_key: str = field(default="")
     llm_base_url: str = field(default="")
 
@@ -189,7 +189,7 @@ def load_settings() -> ForgeSettings:
 
     return ForgeSettings(
         llm_provider=provider_raw,  # type: ignore[arg-type]
-        llm_model=_get_str("FORGE_LLM_MODEL", "gemini-2.0-flash"),
+        llm_model=_get_str("FORGE_LLM_MODEL", "gemini-3.6-flash"),
         llm_api_key=_get_str("FORGE_LLM_API_KEY", ""),
         llm_base_url=_get_str("FORGE_LLM_BASE_URL", ""),
         llm_temperature=_get_float(

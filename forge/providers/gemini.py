@@ -60,7 +60,7 @@ class GeminiProvider(LLMProvider):
         self,
         *,
         api_key: str | None = None,
-        model: str = "gemini-2.0-flash",
+        model: str = "gemini-3.6-flash",
         client: Any = None,
     ) -> None:
         self._model = model

@@ -224,7 +224,7 @@ class LLMProvider(ABC):
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """Model identifier as sent to the provider (e.g. 'gemini-2.0-flash')."""
+        """Model identifier as sent to the provider (e.g. 'gemini-3.6-flash')."""
 
 
 # ---------------------------------------------------------------------------

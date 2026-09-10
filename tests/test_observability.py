@@ -53,7 +53,7 @@ class TestRunTracer:
     def test_record_run_start_captures_experiment_metadata(self, tracer):
         tracer.record_run_start(
             provider="gemini",
-            model="gemini-2.0-flash",
+            model="gemini-3.6-flash",
             temperature=0.0,
             max_output_tokens=4096,
             system_prompt_id="sha256:abc123",
@@ -65,7 +65,7 @@ class TestRunTracer:
         event = tracer._events[0]
         assert event.event_type == RUN_START
         assert event.data["provider"] == "gemini"
-        assert event.data["model"] == "gemini-2.0-flash"
+        assert event.data["model"] == "gemini-3.6-flash"
         assert event.data["system_prompt_id"] == "sha256:abc123"
         assert event.data["tool_exposure_strategy"] == "fixed"
         assert event.data["context_strategy"] == "raw"
