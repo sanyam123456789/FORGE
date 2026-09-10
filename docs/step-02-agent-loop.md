@@ -23,9 +23,19 @@ later research interventions can be layered on without rewriting the runtime.
 - API key from `FORGE_LLM_API_KEY` (or `GEMINI_API_KEY` / `GOOGLE_API_KEY`);
   never hard-coded or logged. `preflight()` fails fast with no network call.
 - Provider/API exceptions are normalised to `forge.llm.LLMError`.
+- **Gemini 3.x thought-signature round-trip.** Gemini 3.x returns an opaque
+  `thought_signature` (bytes) on the response `Part` that carries a
+  `function_call`, and rejects the next request with
+  `400 INVALID_ARGUMENT — Function call is missing a thought_signature` unless
+  that exact value is sent back on the matching `function_call` part. The
+  adapter captures it onto `ToolCall.provider_signature` on the way in and
+  re-attaches it verbatim (never decoded, hashed or truncated) when a later
+  assistant message is translated back into Gemini `contents`. Calls without a
+  signature round-trip unchanged.
 
 ### LLM vocabulary (`forge/llm.py`)
-- New `ToolCall` (`id`, `name`, `arguments`).
+- New `ToolCall` (`id`, `name`, `arguments`, plus the optional opaque
+  `provider_signature` a provider requires echoed back — see Gemini 3.x above).
 - `Message` gains `tool_calls`, `tool_call_id`, `name`.
 - `LLMResponse` gains `tool_calls`, `total_tokens`, `cached_input_tokens`,
   `reasoning_tokens`, `model`, `raw_usage`, plus `has_tool_calls` and
@@ -123,11 +133,11 @@ Import direction is one-way: `agent` → everything; `builtin_tools` → `tools`
 
 ## 5. Testing / verification
 
-`pytest` → **214 passed**, no API key required.
+`pytest` → **219 passed**, no API key required.
 
 | Area | File |
 |---|---|
-| Gemini adapter: request/response translation, usage mapping, missing/partial usage, errors, API-key handling, factory | `tests/test_llm.py` (23) |
+| Gemini adapter: request/response translation, usage mapping, missing/partial usage, errors, API-key handling, factory, **thought-signature round-trip** | `tests/test_llm.py` (28) |
 | The five tools: happy paths, validation errors, workspace-escape, safety errors, registry helpers | `tests/test_builtin_tools.py` (34) |
 | Command blocklist + `.exe` suffix regression + `split_command` | `tests/test_safety.py` (38) |
 | Config bounds (negative / out-of-range / non-numeric) | `tests/test_config.py` (32) |
@@ -136,14 +146,21 @@ Import direction is one-way: `agent` → everything; `builtin_tools` → `tools`
 | Agent loop: happy path, **mocked end-to-end two-step edit**, unknown/malformed/invalid/failing tool calls, provider error, unexpected exception, `max_llm_turns`, `max_tool_calls`, token accounting, trace contents, fixed exposure | `tests/test_agent.py` (23) |
 | CLI: help, run→file, limit→exit 1, `--json`, unimplemented provider→exit 2 | `tests/test_cli.py` (6) |
 
-**Real Gemini API demo: not run** — no API key is configured in this
-environment. No performance or token numbers are reported. The loop is
-verified end to end against a scripted provider with the real built-in tools
-writing real files in a temp workspace.
+The loop is verified end to end against a scripted provider with the real
+built-in tools writing real files in a temp workspace.
+
+**Real Gemini API smoke test: passing** on `gemini-3.6-flash`. A single live
+run of "create `calculator.py` with `add(a, b)` and `multiply(a, b)`"
+completes (`status=completed`): 4 LLM calls, 3 successful tool calls
+(`list_directory` → `write_file` → `run_shell`), the second turn no longer
+fails with the thought-signature error, the file is written and imports
+cleanly, and usage is recorded (input 4185 / output 170 / total 4587 /
+reasoning 232 tokens). Not a benchmark — correctness of the round-trip only.
 
 ## 6. Known limitations
 
-- No real-API run yet (pending credentials).
+- Only a single real-API smoke run has been done (round-trip correctness,
+  not a benchmark).
 - Safety is a heuristic (see §4 and `docs/architecture.md`).
 - Context size is a character-count proxy; no tokenizer.
 - `run_shell` uses `shlex`-style splitting, not a real shell parser.

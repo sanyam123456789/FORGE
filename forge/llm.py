@@ -41,11 +41,19 @@ class ToolCall:
     arguments:
         Parsed keyword arguments for the tool (always a ``dict``; the adapter
         is responsible for parsing provider-native argument payloads).
+    provider_signature:
+        Optional opaque token some providers attach to a tool-call and require
+        to be echoed back verbatim on the following request (e.g. Gemini 3.x
+        ``thought_signature``).  FORGE never inspects, decodes or mutates it —
+        it is carried through the conversation history untouched and handed
+        back to the same provider adapter.  ``None`` when the provider does
+        not use one.
     """
 
     id: str
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
+    provider_signature: Any = field(default=None, repr=False)
 
 
 # ---------------------------------------------------------------------------

@@ -67,10 +67,11 @@ def _text_part(text):
     return SimpleNamespace(text=text, function_call=None)
 
 
-def _fc_part(name, args, call_id="call_abc"):
+def _fc_part(name, args, call_id="call_abc", thought_signature=None):
     return SimpleNamespace(
         text=None,
         function_call=SimpleNamespace(id=call_id, name=name, args=args),
+        thought_signature=thought_signature,
     )
 
 
@@ -283,6 +284,121 @@ class TestResponseTranslation:
         provider = GeminiProvider(api_key="x", client=client)
         resp = provider.complete([Message(role="user", content="hi")])
         assert resp.stop_reason == "length"
+
+
+# ---------------------------------------------------------------------------
+# Gemini 3.x thought_signature round-trip
+#
+# Gemini 3.x returns an opaque ``thought_signature`` (bytes) on the Part that
+# carries a function_call and returns 400 INVALID_ARGUMENT on the next request
+# unless that exact value is echoed back on the matching function_call Part.
+# ---------------------------------------------------------------------------
+
+
+class TestThoughtSignatureRoundTrip:
+    # A non-UTF-8, non-trivial opaque token — must survive verbatim.
+    SIG = b"\x00\x01thought-sig\xff\xfe\x80"
+
+    def test_response_preserves_thought_signature_on_tool_call(self):
+        client = FakeClient(
+            response=_response(
+                [_fc_part("write_file", {"path": "a.py"}, "call_1", thought_signature=self.SIG)]
+            )
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+        resp = provider.complete([Message(role="user", content="make a.py")])
+
+        assert len(resp.tool_calls) == 1
+        # Preserved exactly — same bytes, not decoded / hashed / truncated.
+        assert resp.tool_calls[0].provider_signature == self.SIG
+        assert isinstance(resp.tool_calls[0].provider_signature, bytes)
+
+    def test_request_echoes_thought_signature_back_verbatim(self):
+        client = FakeClient(response=_response([_text_part("done")]))
+        provider = GeminiProvider(api_key="x", client=client)
+
+        provider.complete(
+            [
+                Message(role="user", content="do it"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="c1",
+                            name="write_file",
+                            arguments={"path": "a.py"},
+                            provider_signature=self.SIG,
+                        )
+                    ],
+                ),
+                Message(
+                    role="tool",
+                    content="ok",
+                    tool_call_id="c1",
+                    name="write_file",
+                ),
+            ]
+        )
+
+        contents = client.models.calls[0]["contents"]
+        model_turn = contents[1]
+        assert model_turn.role == "model"
+        fc_parts = [p for p in model_turn.parts if p.function_call is not None]
+        assert len(fc_parts) == 1
+        # Exact same object/bytes handed back to Gemini.
+        assert fc_parts[0].thought_signature == self.SIG
+
+    def test_full_roundtrip_signature_is_stable(self):
+        # Response -> ToolCall -> next request: the signature that lands on the
+        # outgoing Part is byte-for-byte the one Gemini returned.
+        client = FakeClient(
+            response=_response(
+                [_fc_part("write_file", {"path": "a.py"}, "call_1", thought_signature=self.SIG)]
+            )
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+        resp = provider.complete([Message(role="user", content="make a.py")])
+
+        client2 = FakeClient(response=_response([_text_part("done")]))
+        provider2 = GeminiProvider(api_key="x", client=client2)
+        provider2.complete(
+            [
+                Message(role="user", content="make a.py"),
+                Message(role="assistant", content=resp.content, tool_calls=resp.tool_calls),
+                Message(role="tool", content="ok", tool_call_id="call_1", name="write_file"),
+            ]
+        )
+        model_turn = client2.models.calls[0]["contents"][1]
+        fc_parts = [p for p in model_turn.parts if p.function_call is not None]
+        assert fc_parts[0].thought_signature == self.SIG
+
+    def test_function_call_without_signature_is_none(self):
+        client = FakeClient(
+            response=_response([_fc_part("write_file", {"path": "a.py"}, "call_1")])
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+        resp = provider.complete([Message(role="user", content="make a.py")])
+        assert resp.tool_calls[0].provider_signature is None
+
+    def test_request_omits_thought_signature_when_absent(self):
+        client = FakeClient(response=_response([_text_part("done")]))
+        provider = GeminiProvider(api_key="x", client=client)
+        provider.complete(
+            [
+                Message(role="user", content="do it"),
+                Message(
+                    role="assistant",
+                    content="",
+                    tool_calls=[ToolCall(id="c1", name="write_file", arguments={"path": "a"})],
+                ),
+                Message(role="tool", content="ok", tool_call_id="c1", name="write_file"),
+            ]
+        )
+        model_turn = client.models.calls[0]["contents"][1]
+        fc_parts = [p for p in model_turn.parts if p.function_call is not None]
+        assert len(fc_parts) == 1
+        assert fc_parts[0].thought_signature is None
 
 
 # ---------------------------------------------------------------------------

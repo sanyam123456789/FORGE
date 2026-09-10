@@ -176,14 +176,18 @@ class GeminiProvider(LLMProvider):
                 if msg.content:
                     parts.append(types.Part(text=msg.content))
                 for call in msg.tool_calls:
-                    parts.append(
-                        types.Part(
-                            function_call=types.FunctionCall(
-                                name=call.name,
-                                args=call.arguments or {},
-                            )
+                    part_kwargs: dict[str, Any] = {
+                        "function_call": types.FunctionCall(
+                            name=call.name,
+                            args=call.arguments or {},
                         )
-                    )
+                    }
+                    # Echo Gemini 3.x's opaque thought_signature back verbatim
+                    # on the matching function_call Part when we captured one.
+                    signature = getattr(call, "provider_signature", None)
+                    if signature is not None:
+                        part_kwargs["thought_signature"] = signature
+                    parts.append(types.Part(**part_kwargs))
                 if not parts:
                     parts.append(types.Part(text=""))
                 contents.append(types.Content(role="model", parts=parts))
@@ -258,11 +262,18 @@ class GeminiProvider(LLMProvider):
                 if fc is not None:
                     call_id = getattr(fc, "id", None) or f"call_{len(tool_calls)}"
                     raw_args = getattr(fc, "args", None) or {}
+                    # Gemini 3.x attaches an opaque ``thought_signature`` to the
+                    # Part carrying a function_call and rejects the next request
+                    # (400 INVALID_ARGUMENT) unless it is sent back verbatim.
+                    # Preserve it untouched on the ToolCall; may be absent.
                     tool_calls.append(
                         ToolCall(
                             id=str(call_id),
                             name=getattr(fc, "name", "") or "",
                             arguments=dict(raw_args),
+                            provider_signature=getattr(
+                                part, "thought_signature", None
+                            ),
                         )
                     )
 
