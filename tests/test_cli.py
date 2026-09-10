@@ -7,6 +7,8 @@ and no API key are involved.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from forge import cli
@@ -117,4 +119,68 @@ def test_unimplemented_provider_exits_2(tmp_path, monkeypatch):
 
     monkeypatch.setattr("forge.llm.get_provider", _boom)
     code = cli.main(["run", "--task", "t", "--workspace", str(tmp_path), "--no-trace"])
+    assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# `forge evaluate`
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_writes_result_row(tmp_path, monkeypatch, capsys):
+    provider = _Scripted(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="write_file",
+                        arguments={"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"},
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            LLMResponse(content="done", stop_reason="stop"),
+        ]
+    )
+    _patch_provider(monkeypatch, provider)
+    results_file = tmp_path / "eval.jsonl"
+
+    code = cli.main(
+        [
+            "evaluate",
+            "--task", "make calc.py",
+            "--task-id", "calc",
+            "--workspace", str(tmp_path / "ws"),
+            "--results-file", str(results_file),
+            "--no-trace",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["task_id"] == "calc"
+    assert payload["tool_strategy"] == "fixed"
+    assert payload["context_strategy"] == "raw"
+    assert payload["status"] == "completed"
+    assert payload["input_tokens"] is None
+    # one JSONL row appended
+    lines = results_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["run_id"] == payload["run_id"]
+
+
+def test_evaluate_unimplemented_strategy_exits_2(tmp_path, monkeypatch):
+    _patch_provider(monkeypatch, _Scripted([LLMResponse(content="x", stop_reason="stop")]))
+    code = cli.main(
+        [
+            "evaluate",
+            "--task", "t",
+            "--tool-strategy", "adaptive",
+            "--workspace", str(tmp_path / "ws"),
+            "--results-file", str(tmp_path / "eval.jsonl"),
+            "--no-trace",
+        ]
+    )
     assert code == 2

@@ -1,0 +1,75 @@
+"""
+forge.evaluation — measurement infrastructure for controlled FORGE experiments.
+
+This package sits *above* the agent runtime.  It does not contain a second
+agent loop and never talks to a provider SDK directly:
+
+    EvalTask                  what to run (stable identity, optional checks)
+        │
+    ExperimentConfig          the one controlled configuration for a run
+        │                     (provider, model, tool + context strategy, params)
+        ▼
+    EvaluationRunner  ──────►  forge.agent.AgentRuntime  (the only real loop)
+        │                          │
+        │                          ▼
+        │                     JSONL trace + AgentRun
+        ▼
+    EvalResult                one row of metrics (None-safe; never fabricated)
+        │
+    aggregate_results / group_results
+        ▼
+    AggregateStats            success rate, token/latency/cost roll-ups
+
+Only the ``fixed`` tool strategy and the ``raw`` context strategy are
+implemented.  ``adaptive`` tools and ``managed`` context are named here so
+future results can be compared unambiguously, but requesting them raises
+``NotImplementedError`` — this step builds the ruler, not the interventions.
+"""
+
+from __future__ import annotations
+
+from forge.evaluation.aggregate import (
+    AggregateStats,
+    aggregate_results,
+    group_results,
+)
+from forge.evaluation.experiment import (
+    CONTEXT_STRATEGY_RAW,
+    FUTURE_CONTEXT_STRATEGIES,
+    FUTURE_TOOL_STRATEGIES,
+    IMPLEMENTED_CONTEXT_STRATEGIES,
+    IMPLEMENTED_TOOL_STRATEGIES,
+    TOOL_STRATEGY_FIXED,
+    ExperimentConfig,
+)
+from forge.evaluation.result import (
+    EvalResult,
+    TokenPricing,
+    append_result_jsonl,
+    read_results_jsonl,
+    write_results_jsonl,
+)
+from forge.evaluation.runner import EvaluationRunner
+from forge.evaluation.task import ArtifactCheck, CheckOutcome, EvalTask
+
+__all__ = [
+    "EvalTask",
+    "ArtifactCheck",
+    "CheckOutcome",
+    "ExperimentConfig",
+    "TOOL_STRATEGY_FIXED",
+    "CONTEXT_STRATEGY_RAW",
+    "IMPLEMENTED_TOOL_STRATEGIES",
+    "IMPLEMENTED_CONTEXT_STRATEGIES",
+    "FUTURE_TOOL_STRATEGIES",
+    "FUTURE_CONTEXT_STRATEGIES",
+    "EvaluationRunner",
+    "EvalResult",
+    "TokenPricing",
+    "write_results_jsonl",
+    "append_result_jsonl",
+    "read_results_jsonl",
+    "AggregateStats",
+    "aggregate_results",
+    "group_results",
+]

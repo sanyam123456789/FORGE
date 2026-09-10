@@ -105,7 +105,8 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.prompts` | Canonical `FORGE_SYSTEM_PROMPT` and its stable `sha256` identifier. |
 | `forge.agent` | The agent loop. Owns the run lifecycle, hard limits, tool dispatch, and error handling. |
 | `forge.observability` | Record typed events per run. Flush to JSONL. Never fabricate measurements (`None` ≠ `0`). |
-| `forge.cli` | `forge run --task "..."`. |
+| `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. Only `fixed`+`raw` runs; `adaptive`/`managed` raise `NotImplementedError`. See `docs/step-03-evaluation.md`. |
+| `forge.cli` | `forge run --task "..."` and `forge evaluate --task ... --task-id ...`. |
 
 ---
 
