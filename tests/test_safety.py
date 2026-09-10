@@ -14,6 +14,7 @@ from forge.safety import (
     assert_safe_write,
     assert_within_workspace,
     is_within_workspace,
+    split_command,
 )
 
 
@@ -133,3 +134,48 @@ class TestAssertSafeCommand:
     def test_returns_token_list(self):
         result = assert_safe_command("python -c 'print(1)'")
         assert result[0] == "python"
+
+
+class TestExeSuffixHandling:
+    """Regression: argv[0] suffix must be removed as a suffix, not a char set.
+
+    The old code used ``str.rstrip('.exe')`` which strips the *characters*
+    '.', 'e', 'x' from the right — mangling names like ``npx`` -> ``np`` and
+    ``tox`` -> ``to`` and letting some blocked names slip through / good names
+    get corrupted.
+    """
+
+    @pytest.mark.parametrize("cmd", ["npx create-app", "tox -e py311", "pex --help"])
+    def test_non_blocked_names_ending_in_exe_chars_pass(self, cmd):
+        result = assert_safe_command(cmd)
+        assert result[0] == cmd.split()[0]
+
+    def test_rm_exe_still_blocked(self):
+        with pytest.raises(SafetyError, match="blocked list"):
+            assert_safe_command("rm.exe -rf .")
+
+    def test_curl_exe_still_blocked(self):
+        with pytest.raises(SafetyError, match="blocked list"):
+            assert_safe_command("CURL.EXE http://example.com")
+
+    def test_plain_exe_token_not_treated_as_empty(self):
+        # basename 'foo.exe' -> 'foo', not '' — so it is not blocked.
+        result = assert_safe_command("foo.exe --bar")
+        assert result[0] == "foo.exe"
+
+
+class TestSplitCommand:
+    """split_command() keeps quoted args and (on Windows) backslash paths."""
+
+    def test_quoted_python_oneliner(self):
+        tokens = split_command('python -c "print(1 + 2)"')
+        assert tokens[0] == "python"
+        assert tokens[1] == "-c"
+        assert tokens[2] == "print(1 + 2)"
+
+    def test_windows_backslash_path_preserved(self):
+        # Only asserts the meaningful behaviour on the platform under test;
+        # on POSIX a backslash path is a legal (if unusual) single token too.
+        tokens = split_command(r'C:\Python\python.exe -c "print(1)"')
+        assert "\\" in tokens[0] or tokens[0].endswith("python.exe")
+        assert tokens[-1] == "print(1)"

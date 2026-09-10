@@ -9,25 +9,28 @@ research variable in FORGE:
                   ↓                                   ↓
           (all messages kept)            (summarisation / pruning)
 
-Step 1 Status
--------------
-This module defines the ``ConversationContext`` container and its interface.
-The actual pruning/summarisation strategies are NOT implemented yet.
+Status
+------
+- ``ConversationContext`` holds the ordered message history for one run.
+- ``ContextStrategy`` decides which messages are actually sent to the LLM on
+  a given turn.  Step 2 implements ``RawContextStrategy`` only (send the full
+  history unchanged).  A future ``ManagedContextStrategy`` (pruning /
+  summarisation) plugs in at the same seam without touching the agent loop.
+- Token counting is deliberately a character-count proxy for now; accurate
+  tokeniser-based counting is a later concern.
 
 Design
 ------
-- ``ConversationContext`` holds an ordered list of Messages.
-- It exposes ``add_message()`` and ``get_messages()`` with an optional
-  ``strategy`` parameter (future hook for managed context research arm).
-- Token counting is deliberately left as a stub — accurate counting
-  requires knowing the tokeniser for the active model, which is a
-  Step 2/3 concern.
-- The context module is intentionally separated from the agent loop so
-  that different context strategies can be swapped independently.
+- ``ConversationContext`` holds an ordered list of Messages and exposes
+  ``add_message()`` / ``get_messages()`` (the raw, unmodified history).
+- The agent runtime holds a ``ContextStrategy`` and calls
+  ``strategy.prepare(context)`` to obtain the message list for each LLM call.
+  This is the single integration point for the "raw vs managed" research arm.
 """
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from forge.llm import Message
@@ -77,10 +80,10 @@ class ConversationContext:
             )
 
     def get_messages(self) -> list[Message]:
-        """Return the current message list.
+        """Return the full, unmodified message history.
 
-        Future: accept a ``strategy`` parameter to apply managed-context
-        transformations before returning the list to the LLM.
+        Any managed-context transformation is applied by a ``ContextStrategy``
+        (see below), not here — this method always returns the raw history.
         """
         return list(self.messages)
 
@@ -100,9 +103,41 @@ class ConversationContext:
 
     @property
     def approximate_char_count(self) -> int:
-        """Sum of character lengths across all messages.
+        """Sum of character lengths across all message contents.
 
-        This is a rough proxy for context size.  Accurate token counting
-        will be added once provider tokeniser libraries are available.
+        Rough proxy for context size.  Tool-call argument payloads are not
+        included.  Accurate token counting is deferred until it is actually
+        needed by an experiment.
         """
         return sum(len(m.content) for m in self.messages)
+
+
+# ---------------------------------------------------------------------------
+# Context strategies (research arm B seam)
+# ---------------------------------------------------------------------------
+
+
+class ContextStrategy(ABC):
+    """Decides which messages are sent to the LLM for a given turn.
+
+    The agent runtime depends on this abstraction, never on a concrete
+    strategy.  Step 2 ships ``RawContextStrategy`` only.  Managed strategies
+    (last-k, summarisation, ...) are a later research intervention and must
+    slot in here without changes to the agent loop.
+    """
+
+    #: Stable identifier recorded in run traces.
+    name: str = "abstract"
+
+    @abstractmethod
+    def prepare(self, context: "ConversationContext") -> list[Message]:
+        """Return the message list to send to the LLM this turn."""
+
+
+class RawContextStrategy(ContextStrategy):
+    """Baseline: send the full interaction history, unmodified."""
+
+    name = "raw"
+
+    def prepare(self, context: "ConversationContext") -> list[Message]:
+        return context.get_messages()

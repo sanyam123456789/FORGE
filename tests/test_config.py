@@ -17,11 +17,19 @@ class TestDefaultSettings:
 
     def test_default_provider(self, clean_env):
         s = load_settings()
-        assert s.llm_provider == "openai"
+        assert s.llm_provider == "gemini"
 
     def test_default_model(self, clean_env):
         s = load_settings()
-        assert s.llm_model == "gpt-4o"
+        assert s.llm_model == "gemini-2.0-flash"
+
+    def test_default_temperature(self, clean_env):
+        s = load_settings()
+        assert s.llm_temperature == 0.0
+
+    def test_default_max_output_tokens(self, clean_env):
+        s = load_settings()
+        assert s.llm_max_output_tokens == 4096
 
     def test_api_key_default_empty(self, clean_env):
         s = load_settings()
@@ -114,6 +122,47 @@ class TestValidation:
         monkeypatch.setenv("FORGE_MAX_TOOL_CALLS", "not_a_number")
         with pytest.raises(ValueError, match="FORGE_MAX_TOOL_CALLS"):
             load_settings()
+
+
+class TestNumericBounds:
+    """Count / limit settings reject invalid non-positive or out-of-range values."""
+
+    def test_negative_max_tool_calls_rejected(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_MAX_TOOL_CALLS", "-5")
+        with pytest.raises(ValueError, match="minimum"):
+            load_settings()
+
+    def test_zero_max_llm_turns_rejected(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_MAX_LLM_TURNS", "0")
+        with pytest.raises(ValueError, match="minimum"):
+            load_settings()
+
+    def test_negative_max_output_tokens_rejected(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_MAX_OUTPUT_TOKENS", "-1")
+        with pytest.raises(ValueError, match="minimum"):
+            load_settings()
+
+    def test_temperature_out_of_range_rejected(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_TEMPERATURE", "3.5")
+        with pytest.raises(ValueError, match="maximum"):
+            load_settings()
+
+    def test_temperature_negative_rejected(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_TEMPERATURE", "-0.1")
+        with pytest.raises(ValueError, match="minimum"):
+            load_settings()
+
+    def test_temperature_non_numeric_rejected(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_TEMPERATURE", "hot")
+        with pytest.raises(ValueError, match="FORGE_LLM_TEMPERATURE"):
+            load_settings()
+
+    def test_valid_bounds_accepted(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_MAX_TOOL_CALLS", "1")
+        monkeypatch.setenv("FORGE_LLM_TEMPERATURE", "2.0")
+        s = load_settings()
+        assert s.max_tool_calls == 1
+        assert s.llm_temperature == 2.0
 
 
 class TestSecretRedaction:

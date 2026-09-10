@@ -33,7 +33,7 @@ except ImportError:
 # Type aliases
 # ---------------------------------------------------------------------------
 
-LLMProvider = Literal["openai", "anthropic", "google", "openai_compatible"]
+LLMProvider = Literal["gemini", "openai", "anthropic", "google", "openai_compatible"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 LogFormat = Literal["text", "json"]
 
@@ -52,10 +52,14 @@ class ForgeSettings:
     """
 
     # --- LLM provider ---
-    llm_provider: LLMProvider = field(default="openai")
-    llm_model: str = field(default="gpt-4o")
+    llm_provider: LLMProvider = field(default="gemini")
+    llm_model: str = field(default="gemini-2.0-flash")
     llm_api_key: str = field(default="")
     llm_base_url: str = field(default="")
+
+    # --- LLM generation ---
+    llm_temperature: float = field(default=0.0)
+    llm_max_output_tokens: int = field(default=4096)
 
     # --- Runtime ---
     max_tool_calls: int = field(default=50)
@@ -75,6 +79,8 @@ class ForgeSettings:
             f"llm_provider={self.llm_provider!r}, "
             f"llm_model={self.llm_model!r}, "
             f"llm_api_key={key_hint}, "
+            f"llm_temperature={self.llm_temperature}, "
+            f"llm_max_output_tokens={self.llm_max_output_tokens}, "
             f"max_tool_calls={self.max_tool_calls}, "
             f"max_llm_turns={self.max_llm_turns}, "
             f"workspace_root={self.workspace_root!r}, "
@@ -93,16 +99,51 @@ def _get_str(key: str, default: str) -> str:
     return os.environ.get(key, default).strip()
 
 
-def _get_int(key: str, default: int) -> int:
+def _get_int(key: str, default: int, *, min_value: int | None = None) -> int:
     raw = os.environ.get(key, "").strip()
     if not raw:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError as exc:
         raise ValueError(
             f"FORGE configuration error: {key}={raw!r} is not a valid integer."
         ) from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(
+            f"FORGE configuration error: {key}={value} is below the minimum "
+            f"allowed value ({min_value})."
+        )
+    return value
+
+
+def _get_float(
+    key: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"FORGE configuration error: {key}={raw!r} is not a valid number."
+        ) from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(
+            f"FORGE configuration error: {key}={value} is below the minimum "
+            f"allowed value ({min_value})."
+        )
+    if max_value is not None and value > max_value:
+        raise ValueError(
+            f"FORGE configuration error: {key}={value} is above the maximum "
+            f"allowed value ({max_value})."
+        )
+    return value
 
 
 def _get_path(key: str, default: Path) -> Path:
@@ -122,8 +163,8 @@ def load_settings() -> ForgeSettings:
     ``settings`` singleton, but it can also be called again in tests to
     produce fresh instances with overridden environment variables.
     """
-    provider_raw = _get_str("FORGE_LLM_PROVIDER", "openai")
-    valid_providers = {"openai", "anthropic", "google", "openai_compatible"}
+    provider_raw = _get_str("FORGE_LLM_PROVIDER", "gemini")
+    valid_providers = {"gemini", "openai", "anthropic", "google", "openai_compatible"}
     if provider_raw not in valid_providers:
         raise ValueError(
             f"FORGE_LLM_PROVIDER={provider_raw!r} is not supported. "
@@ -148,11 +189,17 @@ def load_settings() -> ForgeSettings:
 
     return ForgeSettings(
         llm_provider=provider_raw,  # type: ignore[arg-type]
-        llm_model=_get_str("FORGE_LLM_MODEL", "gpt-4o"),
+        llm_model=_get_str("FORGE_LLM_MODEL", "gemini-2.0-flash"),
         llm_api_key=_get_str("FORGE_LLM_API_KEY", ""),
         llm_base_url=_get_str("FORGE_LLM_BASE_URL", ""),
-        max_tool_calls=_get_int("FORGE_MAX_TOOL_CALLS", 50),
-        max_llm_turns=_get_int("FORGE_MAX_LLM_TURNS", 30),
+        llm_temperature=_get_float(
+            "FORGE_LLM_TEMPERATURE", 0.0, min_value=0.0, max_value=2.0
+        ),
+        llm_max_output_tokens=_get_int(
+            "FORGE_LLM_MAX_OUTPUT_TOKENS", 4096, min_value=1
+        ),
+        max_tool_calls=_get_int("FORGE_MAX_TOOL_CALLS", 50, min_value=1),
+        max_llm_turns=_get_int("FORGE_MAX_LLM_TURNS", 30, min_value=1),
         workspace_root=_get_path("FORGE_WORKSPACE_ROOT", Path.cwd()),
         log_level=log_level_raw,  # type: ignore[arg-type]
         log_format=log_format_raw,  # type: ignore[arg-type]

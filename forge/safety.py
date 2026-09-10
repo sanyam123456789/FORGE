@@ -238,16 +238,44 @@ _BLOCKED_COMMANDS: frozenset[str] = frozenset(
 )
 
 
+def split_command(cmd: str) -> list[str]:
+    """Split a command string into argv tokens.
+
+    Uses POSIX rules on POSIX platforms.  On Windows, POSIX splitting would
+    destroy backslash path separators (``C:\\Python\\python.exe`` ->
+    ``C:Pythonpython.exe``), so we split in non-POSIX mode and then strip a
+    single layer of matching surrounding quotes from each token.  This is a
+    heuristic suitable for the run_shell tool — it is **not** a shell parser.
+    """
+    if os.name == "nt":
+        try:
+            raw = shlex.split(cmd, posix=False)
+        except ValueError as exc:
+            raise SafetyError(f"Could not parse command: {cmd!r}") from exc
+        tokens: list[str] = []
+        for tok in raw:
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+                tok = tok[1:-1]
+            tokens.append(tok)
+        return tokens
+    try:
+        return shlex.split(cmd)
+    except ValueError as exc:
+        raise SafetyError(f"Could not parse command: {cmd!r}") from exc
+
+
 def assert_safe_command(cmd: str | list[str]) -> list[str]:
     """Check that *cmd* does not invoke a blocked command.
 
-    This is a lightweight heuristic check — NOT a full sandbox.
-    Future versions will use subprocess isolation.
+    This is a lightweight heuristic check — NOT a full sandbox.  It parses the
+    command, inspects only ``argv[0]`` against a static blocklist, and returns
+    the argv tokens.  It does not defend against shell wrappers
+    (``sh -c "rm ..."``), interpreter one-liners, output redirection, etc.
 
     Parameters
     ----------
     cmd:
-        Shell command as a string (will be split) or already split list.
+        Shell command as a string (will be split) or an already-split list.
 
     Returns
     -------
@@ -257,20 +285,24 @@ def assert_safe_command(cmd: str | list[str]) -> list[str]:
     Raises
     ------
     SafetyError
-        If the first token of the command is on the blocked list.
+        If the command is empty/unparseable or ``argv[0]`` is on the blocklist.
     """
     if isinstance(cmd, str):
-        try:
-            tokens = shlex.split(cmd)
-        except ValueError as exc:
-            raise SafetyError(f"Could not parse command: {cmd!r}") from exc
+        tokens = split_command(cmd)
     else:
         tokens = list(cmd)
 
     if not tokens:
         raise SafetyError("Empty command is not permitted.")
 
-    executable = os.path.basename(tokens[0]).lower().rstrip(".exe")
+    executable = os.path.basename(tokens[0]).lower()
+    # Strip a trailing Windows executable suffix (proper suffix removal, not
+    # character-set stripping — ``rstrip('.exe')`` would mangle names like
+    # ``npx`` -> ``np`` or ``tox`` -> ``to``).
+    for _suffix in (".exe", ".bat", ".cmd", ".com"):
+        if executable.endswith(_suffix):
+            executable = executable[: -len(_suffix)]
+            break
     if executable in _BLOCKED_COMMANDS:
         raise SafetyError(
             f"Safety violation: command '{executable}' is on the blocked list.\n"

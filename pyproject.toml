@@ -15,13 +15,19 @@ license = { text = "MIT" }
 # Each dependency must be justified before adding.
 #
 # python-dotenv:  loads .env file into environment at startup.
-#                 Zero transitive dependencies. Required for developer
-#                 convenience (avoids manually exporting env vars).
-#                 Will NOT add logging frameworks, agent frameworks,
-#                 vector stores, databases, or web frameworks in Step 1.
+#                 Zero-config developer convenience; imported lazily.
+# google-genai:   official Google Gemini SDK. Gemini is the current
+#                 (not permanent) LLM provider. Confined to
+#                 forge/providers/gemini.py behind the LLMProvider
+#                 interface; imported lazily so tests and non-LLM code
+#                 paths do not require it.
+#
+# Still deliberately absent: agent frameworks, vector stores, databases,
+# web frameworks, tokenizer libraries.
 # -----------------------------------------------------------------------
 dependencies = [
     "python-dotenv>=1.0",
+    "google-genai>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -31,8 +37,7 @@ dev = [
 ]
 
 [project.scripts]
-# CLI entry point (implementation deferred to Step 2)
-# forge = "forge.cli:main"
+forge = "forge.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

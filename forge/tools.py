@@ -30,9 +30,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from forge.logging import get_logger
+
+if TYPE_CHECKING:
+    from forge.context import ConversationContext
 
 logger = get_logger(__name__)
 
@@ -201,6 +204,55 @@ class ToolRegistry:
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+
+# ---------------------------------------------------------------------------
+# Tool exposure strategies (research arm A seam)
+# ---------------------------------------------------------------------------
+
+
+class ToolExposureStrategy(ABC):
+    """Decides which registered tools are exposed to the LLM for a turn.
+
+    The agent runtime depends on this abstraction, never on adaptive logic
+    directly.  Step 2 ships ``FixedToolExposure`` only.  An ``AdaptiveToolExposure``
+    strategy (relevance-based subsetting) is a later research intervention and
+    must slot in here without changes to the agent loop.
+    """
+
+    #: Stable identifier recorded in run traces.
+    name: str = "abstract"
+
+    @abstractmethod
+    def select(
+        self,
+        registry: "ToolRegistry",
+        context: "ConversationContext | None" = None,
+        task: str | None = None,
+    ) -> list[str] | None:
+        """Return the tool names to expose, or ``None`` to expose all tools."""
+
+
+class FixedToolExposure(ToolExposureStrategy):
+    """Baseline: expose every registered tool on every turn.
+
+    If ``pinned`` is given, exposes exactly those tools instead — still a
+    static, non-adaptive choice (no ranking, no per-turn variation). This is
+    a convenience for tests and manual experiments, not adaptive behaviour.
+    """
+
+    name = "fixed"
+
+    def __init__(self, pinned: list[str] | None = None) -> None:
+        self.pinned = pinned
+
+    def select(
+        self,
+        registry: "ToolRegistry",
+        context: "ConversationContext | None" = None,
+        task: str | None = None,
+    ) -> list[str] | None:
+        return list(self.pinned) if self.pinned is not None else None
 
 
 # ---------------------------------------------------------------------------

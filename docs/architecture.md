@@ -20,7 +20,23 @@ agent in production use.
 
 ---
 
-## Agent Loop (target, Step 2+)
+## Agent Loop (implemented in Step 2)
+
+`AgentRuntime.run()` (`forge/agent.py`) executes:
+
+1. Build `ConversationContext` = system prompt + user task.
+2. `ToolExposureStrategy.select()` → tool subset; `ToolRegistry.get_schemas()`.
+3. `ContextStrategy.prepare(context)` → message list.
+4. `LLMProvider.complete(messages, tools=...)` → normalised `LLMResponse`.
+5. If the response has tool calls: validate each (`_dispatch_tool`), execute
+   through the registry, append a `tool` message per result, loop to step 2.
+6. If the response has no tool calls: its text is the final answer; stop.
+7. Stop early with a terminal status if `max_llm_turns` or `max_tool_calls`
+   is reached, on a provider error, or on any unexpected exception — the run
+   always records a trace and returns an `AgentRun`.
+
+The diagram below shows the same flow with the research seams marked.
+
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -43,8 +59,8 @@ agent in production use.
        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │             LLM Provider Interface (forge.llm)              │
-│  Normalised: Message → LLMResponse + token counts          │
-│  Concrete adapters: OpenAI | Anthropic | Google             │
+│  Normalised: Message / ToolCall → LLMResponse + usage      │
+│  Adapters (forge.providers): gemini  [openai | anthropic …] │
 └──────┬──────────────────────────────────────────────────────┘
        │ tool schemas
        │ ┌──────────────────────────────────────────────────────┐
@@ -81,11 +97,15 @@ agent in production use.
 | `forge.config` | Load and validate all settings from environment variables. No hard-coded secrets ever. |
 | `forge.logging` | Initialise the forge.* logging hierarchy. Text and JSON formatters. |
 | `forge.safety` | Enforce workspace boundaries and command restrictions before any file/shell operation. |
-| `forge.llm` | Define the abstract LLM interface. Concrete adapters sit in `forge/llm/`. |
-| `forge.tools` | Define the `Tool` ABC and `ToolRegistry`. The registry's `get_schemas(subset)` is the adaptive exposure hook. |
-| `forge.context` | Hold the live conversation history for a run. Future: apply pruning/summarisation strategies. |
-| `forge.agent` | Coordinate the agent loop (Step 2). Own the run lifecycle and enforce ceilings. |
-| `forge.observability` | Record typed events per run. Flush to JSONL for analysis. Never fabricate measurements. |
+| `forge.llm` | Provider-agnostic vocabulary (`Message`, `ToolCall`, `LLMResponse`, `LLMError`), the `LLMProvider` ABC, and `get_provider()`. |
+| `forge.providers` | Concrete adapters. `forge.providers.gemini` is the only one so far; nothing else imports a provider SDK. |
+| `forge.tools` | `Tool` ABC, `ToolRegistry` (`get_schemas(subset)` = exposure hook), and the `ToolExposureStrategy` seam (`FixedToolExposure`). |
+| `forge.builtin_tools` | The five concrete tools + `build_default_registry()`. |
+| `forge.context` | `ConversationContext` history container + the `ContextStrategy` seam (`RawContextStrategy`). |
+| `forge.prompts` | Canonical `FORGE_SYSTEM_PROMPT` and its stable `sha256` identifier. |
+| `forge.agent` | The agent loop. Owns the run lifecycle, hard limits, tool dispatch, and error handling. |
+| `forge.observability` | Record typed events per run. Flush to JSONL. Never fabricate measurements (`None` ≠ `0`). |
+| `forge.cli` | `forge run --task "..."`. |
 
 ---
 
@@ -95,35 +115,41 @@ agent in production use.
 
 **Variable:** which tool schemas are passed to the LLM on each turn.
 
-| Condition | Description |
-|---|---|
-| Fixed | All registered tools always exposed (baseline) |
-| Adaptive | Only tools relevant to current task phase exposed |
+| Condition | Description | Status |
+|---|---|---|
+| Fixed | All registered tools always exposed (baseline) | **implemented** (`FixedToolExposure`) |
+| Adaptive | Only tools relevant to the current task phase exposed | later |
 
-**Implementation hook:** `ToolRegistry.get_schemas(subset=None | [names])` in `forge/tools.py`.
+**Seam:** `ToolExposureStrategy.select(registry, context, task) -> list[str] | None`
+in `forge/tools.py`, consumed by `AgentRuntime` and fed to
+`ToolRegistry.get_schemas(subset)`. The agent never branches on an "adaptive"
+flag — it only calls `select()`.
 
 ### Arm B — Context Management Strategy
 
 **Variable:** how the interaction history is prepared before each LLM call.
 
-| Condition | Description |
-|---|---|
-| Raw | Full history passed unchanged |
-| Managed | History pruned or summarised by a strategy |
+| Condition | Description | Status |
+|---|---|---|
+| Raw | Full history passed unchanged | **implemented** (`RawContextStrategy`) |
+| Managed | History pruned or summarised by a strategy | later |
 
-**Implementation hook:** `ConversationContext.get_messages(strategy=...)` in `forge/context.py`.
+**Seam:** `ContextStrategy.prepare(context) -> list[Message]` in
+`forge/context.py`. `ConversationContext.get_messages()` always returns the
+raw, unmodified history; any transformation lives in a strategy, not in the
+container and not in the agent loop.
 
 ### Metrics Collected
 
 | Metric | Source |
 |---|---|
-| Task success | Human evaluation / test suite pass/fail |
-| Input tokens | LLMResponse.input_tokens |
-| Output tokens | LLMResponse.output_tokens |
-| Inference cost | Derived from token counts + provider pricing |
-| Latency | RunTracer.record_llm_call(latency_ms=...) |
-| Context size | ConversationContext.approximate_char_count |
-| LLM calls | RunTracer._llm_calls |
+| Task success | Test suite pass/fail on the produced changes |
+| Input / output / total tokens | `LLMResponse` usage → `RunTracer` (`None` when unreported) |
+| Cached input / reasoning tokens | `LLMResponse.cached_input_tokens` / `.reasoning_tokens` |
+| Inference cost | Derived later from token counts + provider pricing |
+| Latency | `RunTracer.record_llm_response(latency_ms=...)` |
+| Context size | `ConversationContext.approximate_char_count` (char proxy) |
+| LLM calls | `RunTracer._llm_calls` |
 | Tool calls | RunTracer._tool_calls |
 
 ---
@@ -152,14 +178,22 @@ collecting equivalent metrics externally.  It will never be a FORGE dependency.
 
 ## Safety Design
 
-All tool implementations must call `forge.safety` guards before touching the filesystem or shell.
-The current boundaries (Step 1):
+All tool implementations call `forge.safety` guards before touching the
+filesystem or shell. The boundaries:
 
-1. **Workspace root** — all paths resolved and checked via `assert_within_workspace()`.
-2. **Overwrite guard** — existing files require `allow_overwrite=True`.
-3. **Command blocklist** — `rm`, `sudo`, `curl`, `dd`, etc. blocked by `assert_safe_command()`.
+1. **Workspace root** — all paths resolved (symlinks included) and checked via
+   `assert_within_workspace()`.
+2. **Overwrite guard** — existing files require `allow_overwrite=True`
+   (`assert_safe_write()`).
+3. **Command blocklist** — `assert_safe_command()` splits the command
+   (Windows-safe), inspects only `argv[0]` against a static blocklist (`rm`,
+   `del`, `mkfs`, `dd`, `curl`, `wget`, `sudo`, …), and `run_shell` executes
+   with `shell=False` from the workspace root.
 
-Not yet enforced: subprocess sandboxing, network restrictions, read-only zones.
+This is a **heuristic, not a sandbox**. Not enforced: shell-wrapper / one-liner
+evasion (`sh -c "rm ..."`), output redirection, network egress from an allowed
+program, subprocess isolation, read-only zones, rate limiting. Run FORGE
+against disposable workspaces.
 
 ---
 
@@ -173,4 +207,7 @@ Not yet enforced: subprocess sandboxing, network restrictions, read-only zones.
 | Abstract `LLMProvider` interface | Provider adapters are swappable without changing agent logic. |
 | JSONL trace files | Human-readable, easily parsed with `jq` or pandas. No database required. |
 | Frozen `ForgeSettings` dataclass | Prevents accidental mutation of config after startup. |
-| No subprocess sandbox yet | Step 1 scope: establish the safety contract. Actual sandboxing deferred to Step 2/3. |
+| No subprocess sandbox yet | The safety layer is a documented heuristic; a real sandbox is out of scope for the research questions. |
+| Gemini as the first provider (Step 2) | Current, non-permanent choice. Confined to `forge/providers/gemini.py`; `google-genai` is lazy-imported. The rest of FORGE only sees `forge.llm` types. |
+| Strategy *objects* for the research arms | `ToolExposureStrategy` / `ContextStrategy` are injected into `AgentRuntime`. Swapping Fixed→Adaptive or Raw→Managed later needs no change to the loop, and the strategy id is recorded in every trace. |
+| `None` ≠ `0` for usage | A metric a provider does not report is recorded as `None`; input and output availability are tracked independently so a real zero is never invented. |

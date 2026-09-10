@@ -1,21 +1,20 @@
 """
 forge.llm — LLM provider interface layer.
 
-This module defines the abstract contract that every LLM provider adapter
-must satisfy.  Step 1 only defines the interface; concrete implementations
-(OpenAI, Anthropic, Google) will be added in Step 2 when the agent loop
-is built.
+This module defines the provider-agnostic contract that every LLM provider
+adapter must satisfy.  The rest of FORGE (agent runtime, context, tools,
+observability) speaks only the vocabulary defined here — ``Message``,
+``ToolCall``, ``LLMResponse`` — and never touches a provider SDK object.
 
 Design Notes
 ------------
 - The interface is deliberately provider-agnostic.
-- All providers speak the same Message / Response vocabulary.
-- Concrete adapters live in forge/llm/ (one file per provider).
-- The factory function get_provider() constructs the right adapter based
-  on ``settings.llm_provider``.
-- Token usage is returned as part of every LLMResponse so that the
-  observability layer can log it without providers needing to know about
-  the research instrumentation system.
+- Concrete adapters live in ``forge/providers/`` (one module per provider).
+- ``get_provider()`` constructs the right adapter from ``settings.llm_provider``.
+- Token usage is returned as part of every ``LLMResponse`` so the
+  observability layer can record it without providers needing to know
+  anything about the research instrumentation.
+- Unavailable usage metrics are ``None`` — never fabricated / never ``0``.
 """
 
 from __future__ import annotations
@@ -23,6 +22,30 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Tool-call vocabulary
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """A single tool/function invocation requested by the model.
+
+    id:
+        Provider-supplied identifier for the call (may be an empty string if
+        the provider does not supply one; the agent will synthesise one).
+    name:
+        Registered tool name to invoke.
+    arguments:
+        Parsed keyword arguments for the tool (always a ``dict``; the adapter
+        is responsible for parsing provider-native argument payloads).
+    """
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +60,23 @@ class Message:
     role:
         One of 'system' | 'user' | 'assistant' | 'tool'.
     content:
-        Plain-text content (tool call payloads use structured content).
+        Plain-text content.  For an assistant message that only requests
+        tool calls this may be an empty string.
+    tool_calls:
+        For assistant messages: the tool calls the model requested this turn.
+    tool_call_id:
+        For tool messages: the id of the ToolCall this message answers.
+    name:
+        For tool messages: the tool name this message answers.
     metadata:
-        Arbitrary key-value pairs for future extensibility (e.g. tool call IDs).
+        Arbitrary key-value pairs for future extensibility.
     """
 
     role: str
-    content: str
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_call_id: str | None = None
+    name: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -57,26 +90,57 @@ class LLMResponse:
     """Normalised response from any LLM provider.
 
     content:
-        The text/content returned by the model.
-    input_tokens:
-        Number of input tokens consumed (None if not reported by provider).
-    output_tokens:
-        Number of output tokens generated (None if not reported by provider).
+        The text returned by the model (may be empty when only tool calls
+        were emitted).
+    tool_calls:
+        Structured tool calls requested by the model this turn.
+    input_tokens / output_tokens / total_tokens:
+        Provider-reported usage.  ``None`` means the provider did not report
+        that metric — it is never fabricated and never coerced to ``0``.
+        Input and output availability are independent.
+    cached_input_tokens:
+        Provider-reported count of input tokens served from cache, if any.
+    reasoning_tokens:
+        Provider-reported "thinking"/reasoning tokens, if the provider
+        exposes them separately.
     stop_reason:
-        Provider-specific stop reason string (e.g. 'stop', 'length', 'tool_use').
+        Normalised stop reason string (e.g. 'stop', 'length', 'tool_use').
+    model:
+        Model identifier the provider reported handling the request.
+    raw_usage:
+        The provider's raw usage object as a plain dict, for debugging and
+        for later research that needs a metric not surfaced above.
     raw:
-        The raw provider response object for debugging / future features.
+        The raw provider response object (never serialised into traces).
     """
 
-    content: str
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
     input_tokens: int | None = None
     output_tokens: int | None = None
+    total_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
     stop_reason: str = "stop"
+    model: str | None = None
+    raw_usage: dict[str, Any] | None = None
     raw: Any = field(default=None, repr=False)
 
     @property
-    def total_tokens(self) -> int | None:
-        """Return total token count, or None if either component is unavailable."""
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+    @property
+    def resolved_total_tokens(self) -> int | None:
+        """Total tokens: provider-reported if available, else input+output.
+
+        Returns ``None`` when neither the provider total nor both components
+        are available.
+        """
+        if self.total_tokens is not None:
+            return self.total_tokens
         if self.input_tokens is not None and self.output_tokens is not None:
             return self.input_tokens + self.output_tokens
         return None
@@ -87,12 +151,20 @@ class LLMResponse:
 # ---------------------------------------------------------------------------
 
 
+class LLMError(Exception):
+    """Raised by a provider adapter when the underlying API call fails.
+
+    Adapters translate provider-native exceptions into this type so the
+    agent runtime can handle provider failures without importing any
+    provider SDK.
+    """
+
+
 class LLMProvider(ABC):
     """Abstract base class for all LLM provider adapters.
 
-    Each concrete adapter wraps a single provider SDK (e.g. openai, anthropic)
-    and translates between FORGE's Message/LLMResponse types and the provider's
-    native API objects.
+    Each concrete adapter wraps a single provider SDK and translates between
+    FORGE's Message/ToolCall/LLMResponse types and the provider's native API.
     """
 
     @abstractmethod
@@ -111,8 +183,9 @@ class LLMProvider(ABC):
         messages:
             Conversation history including any system prompt.
         tools:
-            Optional list of tool schemas in the provider's expected format.
-            When None, the model is called without tool-use capability.
+            Optional list of tool schemas in FORGE's canonical (OpenAI-style
+            function) format, as produced by ``Tool.to_schema()``.  ``None``
+            or empty means the model is called without tool-use capability.
         max_tokens:
             Maximum number of output tokens to generate.
         temperature:
@@ -122,17 +195,36 @@ class LLMProvider(ABC):
         -------
         LLMResponse
             Normalised response including token usage when available.
+
+        Raises
+        ------
+        LLMError
+            If the provider API call fails.
+        """
+
+    def preflight(self) -> None:
+        """Cheap readiness check run before a run starts.
+
+        Default: no-op.  Adapters override this to fail fast on obvious
+        misconfiguration (e.g. a missing API key) *without* making a network
+        call, so callers can report a configuration error before any run
+        state or trace is created.
+
+        Raises
+        ------
+        ValueError
+            If the adapter is not ready to make requests.
         """
 
     @property
     @abstractmethod
     def provider_name(self) -> str:
-        """Human-readable provider identifier (e.g. 'openai')."""
+        """Human-readable provider identifier (e.g. 'gemini')."""
 
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """Model identifier as sent to the provider (e.g. 'gpt-4o')."""
+        """Model identifier as sent to the provider (e.g. 'gemini-2.0-flash')."""
 
 
 # ---------------------------------------------------------------------------
@@ -140,27 +232,39 @@ class LLMProvider(ABC):
 # ---------------------------------------------------------------------------
 
 
-def get_provider() -> LLMProvider:
+def get_provider(settings_override: Any = None) -> LLMProvider:
     """Construct and return the configured LLM provider adapter.
 
-    Reads ``settings.llm_provider`` and ``settings.llm_model`` to select
-    and configure the appropriate adapter.
+    Reads ``settings.llm_provider`` / ``settings.llm_model`` (or the provided
+    *settings_override*) to select and configure the appropriate adapter.
 
     Raises
     ------
     NotImplementedError
-        If the configured provider has no concrete adapter yet (Step 1 state).
+        If the configured provider has no concrete adapter yet.
     ImportError
         If the required provider SDK is not installed.
     ValueError
-        If the configuration is invalid.
+        If the configuration is invalid (e.g. missing API key).
     """
-    from forge.config import settings  # local import avoids circular deps
+    if settings_override is not None:
+        settings = settings_override
+    else:
+        from forge.config import settings  # local import avoids circular deps
 
     provider = settings.llm_provider
 
-    # Step 2 will fill these in with real adapter modules.
+    if provider == "gemini":
+        from forge.providers.gemini import GeminiProvider
+
+        return GeminiProvider(
+            api_key=settings.llm_api_key or None,
+            model=settings.llm_model,
+        )
+
     raise NotImplementedError(
-        f"LLM provider adapter for '{provider}' is not yet implemented. "
-        "Concrete adapters will be added in Step 2 (forge/llm/openai_adapter.py etc.)."
+        f"LLM provider adapter for '{provider}' is not implemented. "
+        "Step 2 ships the Gemini adapter only; set FORGE_LLM_PROVIDER=gemini. "
+        "Additional adapters (openai, anthropic, ...) can be added under "
+        "forge/providers/ behind the same LLMProvider interface."
     )
