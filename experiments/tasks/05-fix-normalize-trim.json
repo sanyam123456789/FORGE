@@ -1,0 +1,17 @@
+{
+  "task_id": "fix-normalize-trim",
+  "prompt": "normalize(s) in textnorm.py should trim surrounding whitespace and then lowercase, as its docstring states, so normalize('  HeLLo  ') must equal 'hello'. It currently only lowercases and forgets to trim. Fix it. Keep the function name and signature; do not create new files.",
+  "fixtures": { "dir": "fixtures/fix-normalize-trim" },
+  "checks": [
+    {
+      "path": "textnorm.py",
+      "must_contain": ["def normalize(s)", ".lower()", ".strip()"]
+    }
+  ],
+  "metadata": {
+    "category": "bug_fix",
+    "difficulty": "easy",
+    "offline": true,
+    "summary": "Add the missing .strip() to a string-normalisation helper."
+  }
+}

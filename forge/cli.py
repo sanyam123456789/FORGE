@@ -2,11 +2,13 @@
 forge.cli — minimal command-line entry point.
 
     forge run --task "Create add.py with an add(a, b) function"
-    forge evaluate --task "Create add.py ..." --task-id add-fn
+    forge tasks
+    forge evaluate --suite-task-id create-string-utils
 
-`run` executes the agent once and prints a summary.  `evaluate` wraps the
-same runtime in the measurement layer (forge.evaluation): it runs one task
-under one controlled strategy configuration and appends a structured
+`run` executes the agent once and prints a summary.  `tasks` lists the
+version-controlled baseline task suite (``experiments/tasks/``).  `evaluate`
+wraps the same runtime in the measurement layer (forge.evaluation): it runs
+one task under one controlled strategy configuration and appends a structured
 ``EvalResult`` row to a JSONL file for later comparison.
 
 run options:
@@ -20,9 +22,14 @@ run options:
     --json                  print the run summary as JSON
     --quiet                 only print the final answer
 
+tasks options:
+    --suite-dir PATH         task suite dir (default: experiments/tasks)
+    --json                   print the suite as JSON
+
 evaluate options:
-    --task TEXT / --task-file PATH   inline prompt, or a task JSON file
-    --task-id ID             stable task identity (default: derived)
+    --task TEXT / --task-file PATH / --suite-task-id ID   (choose one)
+    --task-id ID             override the stable task identity
+    --suite-dir PATH         suite dir for --suite-task-id
     --tool-strategy NAME     fixed (only implemented value)
     --context-strategy NAME  raw   (only implemented value)
     --workspace PATH         reuse a workspace (default: temp dir, cleaned)
@@ -61,11 +68,26 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--json", action="store_true", help="print the run summary as JSON")
     run.add_argument("--quiet", action="store_true", help="only print the final answer")
 
+    tk = sub.add_parser("tasks", help="list the baseline evaluation task suite")
+    tk.add_argument(
+        "--suite-dir", default=None,
+        help="task suite directory (default: experiments/tasks)",
+    )
+    tk.add_argument("--json", action="store_true", help="print the suite as JSON")
+
     ev = sub.add_parser("evaluate", help="run one task under a controlled config and record metrics")
     src = ev.add_mutually_exclusive_group(required=True)
     src.add_argument("--task", default=None, help="inline task prompt")
     src.add_argument("--task-file", default=None, help="path to a task JSON file")
-    ev.add_argument("--task-id", default=None, help="stable task id (default: derived)")
+    src.add_argument(
+        "--suite-task-id", default=None,
+        help="run a task from the baseline suite by its task_id",
+    )
+    ev.add_argument(
+        "--suite-dir", default=None,
+        help="task suite directory for --suite-task-id (default: experiments/tasks)",
+    )
+    ev.add_argument("--task-id", default=None, help="override the stable task id (default: keep as defined)")
     ev.add_argument(
         "--tool-strategy", default="fixed",
         help="tool exposure strategy (implemented: fixed)",
@@ -168,17 +190,50 @@ def _run_command(args: argparse.Namespace) -> int:
 
 
 def _load_eval_task(args: argparse.Namespace):
-    """Build an ``EvalTask`` from --task or --task-file."""
+    """Build an ``EvalTask`` from --task, --task-file, or --suite-task-id."""
+    import dataclasses
+
     from forge.evaluation import EvalTask
+    from forge.evaluation.suite import DEFAULT_TASKS_DIR, get_task, load_task
+
+    if getattr(args, "suite_task_id", None):
+        tasks_dir = Path(args.suite_dir) if args.suite_dir else DEFAULT_TASKS_DIR
+        task = get_task(args.suite_task_id, tasks_dir=tasks_dir)
+        return dataclasses.replace(task, task_id=args.task_id) if args.task_id else task
 
     if args.task_file:
-        data = json.loads(Path(args.task_file).read_text(encoding="utf-8"))
-        if args.task_id:
-            data = {**data, "task_id": args.task_id}
-        return EvalTask.from_dict(data)
+        task = load_task(Path(args.task_file))
+        return dataclasses.replace(task, task_id=args.task_id) if args.task_id else task
 
     task_id = args.task_id or "adhoc"
     return EvalTask(task_id=task_id, prompt=args.task)
+
+
+def _tasks_command(args: argparse.Namespace) -> int:
+    from forge.evaluation.suite import DEFAULT_TASKS_DIR, TaskSuiteError, load_suite
+
+    tasks_dir = Path(args.suite_dir) if args.suite_dir else DEFAULT_TASKS_DIR
+    try:
+        tasks = load_suite(tasks_dir)
+    except (OSError, TaskSuiteError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps([t.to_dict() for t in tasks], indent=2))
+        return 0
+
+    print(f"baseline task suite: {tasks_dir}  ({len(tasks)} tasks)\n")
+    print(f"  {'task_id':<30} {'category':<14} {'diff':<7} checks fixtures")
+    print(f"  {'-' * 30} {'-' * 14} {'-' * 7} {'-' * 6} {'-' * 8}")
+    for t in tasks:
+        cat = str(t.metadata.get("category", "-"))
+        diff = str(t.metadata.get("difficulty", "-"))
+        print(
+            f"  {t.task_id:<30} {cat:<14} {diff:<7} "
+            f"{len(t.checks):<6} {len(t.fixtures)}"
+        )
+    return 0
 
 
 def _evaluate_command(args: argparse.Namespace) -> int:
@@ -201,7 +256,7 @@ def _evaluate_command(args: argparse.Namespace) -> int:
 
     try:
         task = _load_eval_task(args)
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"error: could not load task: {exc}", file=sys.stderr)
         return 2
 
@@ -282,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run_command(args)
+    if args.command == "tasks":
+        return _tasks_command(args)
     if args.command == "evaluate":
         return _evaluate_command(args)
     parser.print_help()

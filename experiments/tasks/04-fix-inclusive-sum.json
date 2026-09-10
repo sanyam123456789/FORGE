@@ -1,0 +1,26 @@
+{
+  "task_id": "fix-inclusive-sum",
+  "prompt": "The function inclusive_sum(n) in ranges.py should return the sum of all integers from 1 to n inclusive, so inclusive_sum(5) must equal 15. It is currently off by one and excludes n (it returns 10 for n=5). Fix the implementation. Do not change the function name or signature, and do not create new files.",
+  "fixtures": { "dir": "fixtures/fix-inclusive-sum" },
+  "checks": [
+    {
+      "path": "ranges.py",
+      "must_contain": ["def inclusive_sum(n)"],
+      "must_contain_any": [
+        "range(n + 1)",
+        "range(1, n + 1)",
+        "range(n+1)",
+        "range(1, n+1)",
+        "n * (n + 1)",
+        "n*(n+1)"
+      ],
+      "must_not_contain": ["sum(range(n))"]
+    }
+  ],
+  "metadata": {
+    "category": "bug_fix",
+    "difficulty": "medium",
+    "offline": true,
+    "summary": "Fix an off-by-one error in an inclusive range sum."
+  }
+}

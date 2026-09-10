@@ -1,0 +1,23 @@
+{
+  "task_id": "multi-file-timeout-setting",
+  "prompt": "Two coordinated changes across two files. (1) In settings_mod.py, change the value of TIMEOUT from 10 to 30. (2) In client.py, stop hardcoding the timeout inside make_request: import TIMEOUT from settings_mod and use that value instead of the literal 10. Keep make_request's return value shape ({\"url\": ..., \"timeout\": ...}) the same. Do not create new files.",
+  "fixtures": { "dir": "fixtures/multi-file-timeout-setting" },
+  "checks": [
+    {
+      "path": "settings_mod.py",
+      "must_contain": ["TIMEOUT = 30"]
+    },
+    {
+      "path": "client.py",
+      "must_contain": ["TIMEOUT"],
+      "must_contain_any": ["from settings_mod import TIMEOUT", "import settings_mod"],
+      "must_not_contain": ["timeout = 10"]
+    }
+  ],
+  "metadata": {
+    "category": "multi_file",
+    "difficulty": "medium",
+    "offline": true,
+    "summary": "Replace a hardcoded constant with a shared setting across two files."
+  }
+}

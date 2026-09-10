@@ -1,0 +1,17 @@
+{
+  "task_id": "edit-report-summary",
+  "prompt": "Edit the existing function summarize(rows) in report.py so its returned dict, in addition to the existing \"count\" key, also includes \"total\" (the sum of every row's \"amount\" value) and \"max\" (the largest \"amount\" value, or 0 when rows is empty). Keep the function name and signature. Do not create new files.",
+  "fixtures": { "dir": "fixtures/edit-report-summary" },
+  "checks": [
+    {
+      "path": "report.py",
+      "must_contain": ["def summarize(", "count", "total", "max"]
+    }
+  ],
+  "metadata": {
+    "category": "file_editing",
+    "difficulty": "medium",
+    "offline": true,
+    "summary": "Extend an existing summary function with total and max fields."
+  }
+}

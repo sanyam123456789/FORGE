@@ -1,0 +1,16 @@
+{
+  "task_id": "create-json-config-io",
+  "prompt": "Create a new file named config_io.py in the workspace root that uses the standard library json module. Define load_config(path): read the JSON file at path (UTF-8) and return the parsed dict. Define save_config(path, data): write data to path as JSON (UTF-8) using indent=2. Add a short module docstring. Do not add tests.",
+  "checks": [
+    {
+      "path": "config_io.py",
+      "must_contain": ["import json", "def load_config(", "def save_config(", "indent=2"]
+    }
+  ],
+  "metadata": {
+    "category": "file_creation",
+    "difficulty": "easy",
+    "offline": true,
+    "summary": "Create a JSON load/save helper module using the stdlib json module."
+  }
+}

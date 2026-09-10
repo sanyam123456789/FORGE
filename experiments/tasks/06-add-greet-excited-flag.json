@@ -1,0 +1,17 @@
+{
+  "task_id": "add-greet-excited-flag",
+  "prompt": "Add an optional keyword parameter excited (default False) to greet(name) in greet.py. When excited is True, the greeting must end with '!!!' instead of a single '!'. When excited is False, the output must be exactly as it is today: 'Hello, <name>!'. Keep the function name. Do not create new files.",
+  "fixtures": { "dir": "fixtures/add-greet-excited-flag" },
+  "checks": [
+    {
+      "path": "greet.py",
+      "must_contain": ["def greet(", "excited", "!!!"]
+    }
+  ],
+  "metadata": {
+    "category": "small_feature",
+    "difficulty": "easy",
+    "offline": true,
+    "summary": "Add an optional 'excited' flag to a greeting function."
+  }
+}

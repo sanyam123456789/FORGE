@@ -1,0 +1,17 @@
+{
+  "task_id": "add-mathlib-tests",
+  "prompt": "Create a file named test_mathlib.py in the workspace root containing pytest-style tests for the functions in mathlib.py. Include a function test_is_prime that asserts is_prime(7) is True and is_prime(8) is False, and a function test_factorial that asserts factorial(0) == 1 and factorial(5) == 120. Import the functions from mathlib. You may use the run_shell tool to run 'python -m pytest -q' and confirm the tests pass. Do not modify mathlib.py.",
+  "fixtures": { "dir": "fixtures/add-mathlib-tests" },
+  "checks": [
+    {
+      "path": "test_mathlib.py",
+      "must_contain": ["import", "mathlib", "def test_is_prime(", "def test_factorial("]
+    }
+  ],
+  "metadata": {
+    "category": "testing",
+    "difficulty": "medium",
+    "offline": true,
+    "summary": "Write pytest tests for an existing small module."
+  }
+}

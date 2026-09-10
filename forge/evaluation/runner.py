@@ -100,6 +100,14 @@ class EvaluationRunner:
         )
         ws_path.mkdir(parents=True, exist_ok=True)
 
+        # Provision any starter/fixture files the task carries, before the
+        # agent runs. Tasks with no fixtures make this a no-op.
+        provisioned = task.provision(ws_path)
+        if provisioned:
+            logger.debug(
+                "Provisioned %d fixture file(s) into %s", len(provisioned), ws_path
+            )
+
         provider = self._provider or get_provider(settings_override=self._settings)
 
         agent_config = AgentConfig(

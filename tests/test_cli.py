@@ -184,3 +184,81 @@ def test_evaluate_unimplemented_strategy_exits_2(tmp_path, monkeypatch):
         ]
     )
     assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# `forge tasks` + `forge evaluate --suite-task-id`
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_lists_baseline_suite(capsys):
+    assert cli.main(["tasks"]) == 0
+    out = capsys.readouterr().out
+    assert "baseline task suite" in out
+    assert "create-string-utils" in out
+
+
+def test_tasks_json_output(capsys):
+    assert cli.main(["tasks", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list) and len(payload) >= 8
+    assert all("task_id" in t and "metadata" in t for t in payload)
+
+
+def test_tasks_bad_dir_exits_2(tmp_path, capsys):
+    assert cli.main(["tasks", "--suite-dir", str(tmp_path / "nope")]) == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def test_evaluate_suite_task_id_runs(tmp_path, monkeypatch, capsys):
+    fixed = "def inclusive_sum(n):\n    return sum(range(n + 1))\n"
+    provider = _Scripted(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="write_file",
+                        arguments={"path": "ranges.py", "content": fixed, "overwrite": True},
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            LLMResponse(content="fixed", stop_reason="stop"),
+        ]
+    )
+    _patch_provider(monkeypatch, provider)
+    results_file = tmp_path / "eval.jsonl"
+
+    code = cli.main(
+        [
+            "evaluate",
+            "--suite-task-id", "fix-inclusive-sum",
+            "--workspace", str(tmp_path / "ws"),
+            "--results-file", str(results_file),
+            "--no-trace",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["task_id"] == "fix-inclusive-sum"
+    assert payload["checks_passed"] is True
+    assert payload["success"] is True
+    # fixture was provisioned into the workspace
+    assert (tmp_path / "ws" / "ranges.py").exists()
+
+
+def test_evaluate_unknown_suite_task_id_exits_2(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _Scripted([LLMResponse(content="x", stop_reason="stop")]))
+    code = cli.main(
+        [
+            "evaluate",
+            "--suite-task-id", "no-such-task",
+            "--workspace", str(tmp_path / "ws"),
+            "--no-trace",
+        ]
+    )
+    assert code == 2
+    assert "unknown task_id" in capsys.readouterr().err

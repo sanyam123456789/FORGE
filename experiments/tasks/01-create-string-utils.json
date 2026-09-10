@@ -1,0 +1,16 @@
+{
+  "task_id": "create-string-utils",
+  "prompt": "Create a new file named string_utils.py in the workspace root. It must define two functions. slugify(text): lowercase the text, strip leading and trailing whitespace, and replace every run of internal whitespace with a single hyphen '-'. shout(text): return the text uppercased with a single trailing '!'. Give each function a short docstring. You do not need to add tests.",
+  "checks": [
+    {
+      "path": "string_utils.py",
+      "must_contain": ["def slugify(", "def shout("]
+    }
+  ],
+  "metadata": {
+    "category": "file_creation",
+    "difficulty": "easy",
+    "offline": true,
+    "summary": "Create a small string-utility module with two functions."
+  }
+}

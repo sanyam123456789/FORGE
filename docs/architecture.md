@@ -106,7 +106,8 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.agent` | The agent loop. Owns the run lifecycle, hard limits, tool dispatch, and error handling. |
 | `forge.observability` | Record typed events per run. Flush to JSONL. Never fabricate measurements (`None` ≠ `0`). |
 | `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. Only `fixed`+`raw` runs; `adaptive`/`managed` raise `NotImplementedError`. See `docs/step-03-evaluation.md`. |
-| `forge.cli` | `forge run --task "..."` and `forge evaluate --task ... --task-id ...`. |
+| `forge.evaluation.suite` | Step 4 loader for the version-controlled baseline task suite in `experiments/tasks/` (→ ordinary `EvalTask`s, with fixtures provisioned into the run workspace). See `docs/step-04-baseline-tasks.md`. |
+| `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`. |
 
 ---
 

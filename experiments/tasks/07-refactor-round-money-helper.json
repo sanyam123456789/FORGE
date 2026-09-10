@@ -1,0 +1,22 @@
+{
+  "task_id": "refactor-round-money-helper",
+  "prompt": "In pricing.py, price_with_tax and discounted_price both round to whole cents with the same two lines: 'cents = round(total * 100)' then 'return cents / 100'. Extract that shared logic into a new module-level helper named _round_money(value) that returns value rounded to whole cents, and call it from both functions. The observable behavior of both functions must stay exactly the same. Do not create new files.",
+  "fixtures": { "dir": "fixtures/refactor-round-money-helper" },
+  "checks": [
+    {
+      "path": "pricing.py",
+      "must_contain": [
+        "def _round_money(",
+        "_round_money(",
+        "def price_with_tax(",
+        "def discounted_price("
+      ]
+    }
+  ],
+  "metadata": {
+    "category": "refactoring",
+    "difficulty": "medium",
+    "offline": true,
+    "summary": "Extract duplicated rounding logic into a shared helper."
+  }
+}

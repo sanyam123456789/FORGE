@@ -1,0 +1,18 @@
+{
+  "task_id": "rename-tally-to-count-items",
+  "prompt": "In counter.py, rename the public function tally to count_items. Also update the docstring's self-reference so it reads 'count_items()' instead of 'tally()'. The behavior must be identical. No other files call this function. Do not create new files.",
+  "fixtures": { "dir": "fixtures/rename-tally-to-count-items" },
+  "checks": [
+    {
+      "path": "counter.py",
+      "must_contain": ["def count_items("],
+      "must_not_contain": ["def tally(", "tally()"]
+    }
+  ],
+  "metadata": {
+    "category": "refactoring",
+    "difficulty": "easy",
+    "offline": true,
+    "summary": "Rename a public function and its docstring self-reference."
+  }
+}
