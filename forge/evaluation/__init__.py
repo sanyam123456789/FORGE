@@ -26,9 +26,12 @@ abstraction.
 
 Both the ``fixed``/``adaptive`` tool strategies (Step 5) and the
 ``raw``/``managed`` context strategies (Step 6) are implemented, so all four
-combinations are selectable and runnable. The formal 2x2 controlled
-experiment (many tasks, repeated runs, statistical comparison) is Step 7 and
-is NOT implemented here.
+combinations are selectable and runnable. ``forge.evaluation.matrix``
+(Step 7) runs the same tasks under all four arms (``fixed_raw``,
+``fixed_managed``, ``adaptive_raw``, ``adaptive_managed``) and collects
+comparable, reloadable ``EvalResult`` rows — see
+``docs/step-07-controlled-2x2-experiment.md``. Statistical analysis of those
+results is Step 8 and is NOT implemented here.
 """
 
 from __future__ import annotations
@@ -55,6 +58,21 @@ from forge.evaluation.result import (
     append_result_jsonl,
     read_results_jsonl,
     write_results_jsonl,
+)
+from forge.evaluation.matrix import (
+    ARM_ADAPTIVE_MANAGED,
+    ARM_ADAPTIVE_RAW,
+    ARM_FIXED_MANAGED,
+    ARM_FIXED_RAW,
+    ARMS,
+    ARMS_BY_ID,
+    STATUS_RUNNER_ERROR,
+    ExperimentArm,
+    MatrixExperimentSummary,
+    MatrixRunner,
+    arms_by_ids,
+    outcome_category,
+    read_matrix_metadata,
 )
 from forge.evaluation.runner import EvaluationRunner
 from forge.evaluation.suite import (
@@ -108,4 +126,18 @@ __all__ = [
     "AggregateStats",
     "aggregate_results",
     "group_results",
+    # formal 2x2 controlled experiment (Step 7)
+    "ExperimentArm",
+    "ARMS",
+    "ARMS_BY_ID",
+    "ARM_FIXED_RAW",
+    "ARM_FIXED_MANAGED",
+    "ARM_ADAPTIVE_RAW",
+    "ARM_ADAPTIVE_MANAGED",
+    "arms_by_ids",
+    "MatrixRunner",
+    "MatrixExperimentSummary",
+    "read_matrix_metadata",
+    "outcome_category",
+    "STATUS_RUNNER_ERROR",
 ]

@@ -4,12 +4,17 @@ forge.cli — minimal command-line entry point.
     forge run --task "Create add.py with an add(a, b) function"
     forge tasks
     forge evaluate --suite-task-id create-string-utils
+    forge experiment --suite-dir experiments/tasks
 
 `run` executes the agent once and prints a summary.  `tasks` lists the
 version-controlled baseline task suite (``experiments/tasks/``).  `evaluate`
 wraps the same runtime in the measurement layer (forge.evaluation): it runs
 one task under one controlled strategy configuration and appends a structured
-``EvalResult`` row to a JSONL file for later comparison.
+``EvalResult`` row to a JSONL file for later comparison.  `experiment` runs
+the formal 2x2 controlled experiment (Step 7): every selected task under all
+four arms (fixed_raw, fixed_managed, adaptive_raw, adaptive_managed), each in
+its own isolated workspace, writing one JSONL results file plus a metadata
+file per experiment run.
 
 run options:
     --task TEXT              the coding task (required)
@@ -36,10 +41,32 @@ evaluate options:
     --results-file PATH      JSONL to append the result to
     --model / --max-turns / --max-tool-calls / --temperature / --no-trace / --json
 
+experiment options:
+    --suite-dir PATH         task suite dir (default: experiments/tasks)
+    --task-id ID             restrict to this task (repeatable; default: full suite)
+    --arm ARM_ID             restrict to this arm (repeatable; default: all four —
+                             fixed_raw, fixed_managed, adaptive_raw, adaptive_managed)
+    --output-dir PATH        where to write <experiment_id>/ (default: runs/experiments)
+    --experiment-id ID       override the generated experiment id
+    --label TEXT             optional batch label recorded with every result
+    --model / --max-turns / --max-tool-calls / --temperature / --no-trace / --json
+
+    NOTE: with no provider override this calls the real configured LLM
+    provider (Gemini by default) once per task-arm execution — a full 4-arm
+    run against the baseline suite is one real API call sequence per cell
+    and will consume real quota. Use a small --task-id/--arm subset for a
+    quick check; see docs/step-07-controlled-2x2-experiment.md for how to
+    drive it with a scripted/fake provider instead (as the test suite does).
+
 Exit codes:
-    0  run completed
-    1  run stopped without completing (limit / provider error / failure)
-    2  configuration problem (e.g. no API key, unimplemented strategy)
+    0  run completed (for `experiment`: the batch ran to completion — this
+       does not mean every individual task-arm succeeded, only that the
+       experiment itself did not fail to run; inspect the written results
+       for per-task-arm outcomes)
+    1  run stopped without completing (limit / provider error / failure) —
+       `evaluate` only
+    2  configuration problem (e.g. no API key, unimplemented strategy,
+       unknown task/arm id)
 """
 
 from __future__ import annotations
@@ -108,6 +135,36 @@ def _build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--label", default=None, help="optional batch label recorded with the result")
     ev.add_argument("--no-trace", action="store_true", help="do not write a JSONL run trace")
     ev.add_argument("--json", action="store_true", help="print the EvalResult as JSON")
+
+    exp = sub.add_parser(
+        "experiment",
+        help="run the formal 2x2 controlled experiment (fixed/adaptive x raw/managed)",
+    )
+    exp.add_argument(
+        "--suite-dir", default=None,
+        help="task suite directory (default: experiments/tasks)",
+    )
+    exp.add_argument(
+        "--task-id", dest="task_ids", action="append", default=None,
+        help="restrict to this task_id (repeatable; default: the full suite)",
+    )
+    exp.add_argument(
+        "--arm", dest="arm_ids", action="append", default=None,
+        choices=["fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed"],
+        help="restrict to this arm (repeatable; default: all four)",
+    )
+    exp.add_argument(
+        "--output-dir", default=None,
+        help="where to write <experiment_id>/ (default: runs/experiments)",
+    )
+    exp.add_argument("--experiment-id", default=None, help="override the generated experiment id")
+    exp.add_argument("--label", default=None, help="optional batch label recorded with every result")
+    exp.add_argument("--model", default=None, help="override the model name")
+    exp.add_argument("--max-turns", type=int, default=None, help="max LLM turns")
+    exp.add_argument("--max-tool-calls", type=int, default=None, help="max tool calls")
+    exp.add_argument("--temperature", type=float, default=None, help="sampling temperature")
+    exp.add_argument("--no-trace", action="store_true", help="do not write per-run JSONL traces")
+    exp.add_argument("--json", action="store_true", help="print the experiment summary as JSON")
     return parser
 
 
@@ -335,6 +392,108 @@ def _evaluate_command(args: argparse.Namespace) -> int:
     return 0 if result.success else 1
 
 
+def _experiment_command(args: argparse.Namespace) -> int:
+    import os
+
+    from forge.config import load_settings
+    from forge.evaluation import ARMS, MatrixRunner, aggregate_results, arms_by_ids
+    from forge.evaluation.suite import DEFAULT_TASKS_DIR, TaskSuiteError, load_suite
+    from forge.llm import get_provider
+    from forge.logging import setup_logging
+
+    if args.model:
+        os.environ["FORGE_LLM_MODEL"] = args.model
+
+    settings = load_settings()
+    setup_logging(level=settings.log_level, fmt=settings.log_format)
+
+    tasks_dir = Path(args.suite_dir) if args.suite_dir else DEFAULT_TASKS_DIR
+    try:
+        suite = load_suite(tasks_dir)
+    except (OSError, TaskSuiteError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.task_ids:
+        wanted = set(args.task_ids)
+        known = {t.task_id for t in suite}
+        unknown = wanted - known
+        if unknown:
+            print(
+                f"error: unknown task_id(s) {sorted(unknown)}. "
+                f"Available: {sorted(known)}",
+                file=sys.stderr,
+            )
+            return 2
+        # Preserve the suite's own (filename-sorted) order, not CLI arg order.
+        tasks = [t for t in suite if t.task_id in wanted]
+    else:
+        tasks = suite
+
+    try:
+        arms = arms_by_ids(args.arm_ids) if args.arm_ids else ARMS
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # Fail fast (exit 2) on a provider/key problem before running anything,
+    # exactly like `forge run` / `forge evaluate`.
+    try:
+        get_provider(settings_override=settings).preflight()
+    except (ImportError, NotImplementedError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    output_root = Path(args.output_dir) if args.output_dir else Path("runs") / "experiments"
+
+    if not args.json:
+        print(f"FORGE {__version__}  experiment  provider={settings.llm_provider} model={settings.llm_model}")
+        print(f"tasks: {[t.task_id for t in tasks]}")
+        print(f"arms:  {[a.arm_id for a in arms]}")
+        print(f"output: {output_root}\n")
+
+    runner = MatrixRunner(
+        settings=settings,
+        output_root=output_root,
+        write_trace=not args.no_trace,
+    )
+    results, summary = runner.run(
+        tasks,
+        arms=arms,
+        experiment_id=args.experiment_id,
+        label=args.label,
+    )
+
+    # Group by arm_id (not the raw "<tool>+<context>" key group_results()
+    # uses) for a clearer per-arm table — one arm is exactly one such pair,
+    # so this is the same aggregation, just keyed the way this CLI names arms.
+    by_arm: dict[str, list] = {a.arm_id: [] for a in arms}
+    for r in results:
+        by_arm.setdefault(r.arm_id, []).append(r)
+    aggregates = {arm_id: aggregate_results(rows) for arm_id, rows in by_arm.items()}
+
+    if args.json:
+        print(json.dumps(
+            {
+                "summary": summary.to_dict(),
+                "aggregates": {k: v.to_dict() for k, v in aggregates.items()},
+            },
+            indent=2,
+        ))
+    else:
+        print(f"experiment_id: {summary.experiment_id}")
+        print(f"results file:  {summary.results_file}")
+        print(f"{len(results)} task-arm result(s)\n")
+        print(f"  {'arm':<20} {'tasks':>5} {'success':>7} {'rate':>6}")
+        print(f"  {'-' * 20} {'-' * 5} {'-' * 7} {'-' * 6}")
+        for arm in arms:
+            agg = aggregates[arm.arm_id]
+            rate = f"{agg.success_rate:.0%}" if agg.success_rate is not None else "n/a"
+            print(f"  {arm.arm_id:<20} {agg.task_count:>5} {agg.successful_tasks:>7} {rate:>6}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -344,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         return _tasks_command(args)
     if args.command == "evaluate":
         return _evaluate_command(args)
+    if args.command == "experiment":
+        return _experiment_command(args)
     parser.print_help()
     return 0
 

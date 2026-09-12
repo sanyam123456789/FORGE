@@ -107,7 +107,8 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.observability` | Record typed events per run. Flush to JSONL. Never fabricate measurements (`None` ≠ `0`). |
 | `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. `fixed`/`adaptive` tool strategies (Step 5) and `raw`/`managed` context strategies (Step 6) are all implemented and freely combinable. See `docs/step-03-evaluation.md`, `docs/step-05-adaptive-tool-exposure.md`, `docs/step-06-managed-context.md`. |
 | `forge.evaluation.suite` | Step 4 loader for the version-controlled baseline task suite in `experiments/tasks/` (→ ordinary `EvalTask`s, with fixtures provisioned into the run workspace). See `docs/step-04-baseline-tasks.md`. |
-| `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`. |
+| `forge.evaluation.matrix` | Step 7 formal 2x2 controlled experiment: `ExperimentArm`, `ARMS`, `MatrixRunner` runs every selected task under every arm (`fixed_raw`, `fixed_managed`, `adaptive_raw`, `adaptive_managed`), each in its own isolated workspace, and writes one reloadable JSONL results file + a metadata file per experiment. Orchestration only — every task-arm execution is one `EvaluationRunner.run()` call. See `docs/step-07-controlled-2x2-experiment.md`. |
+| `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`, `forge experiment` (the 2x2 matrix). |
 
 ---
 
@@ -147,6 +148,25 @@ before/after, items dropped/compressed) for measurement — this never
 affects what is sent to the LLM. See
 `docs/step-06-managed-context.md` for the full policy, its determinism
 argument, and its limitations.
+
+### The Formal 2x2 (Step 7)
+
+Arm A and Arm B are independent seams, so their four combinations are all
+individually resolvable (Step 6). Step 7 adds `forge.evaluation.matrix`,
+which actually *runs* the same controlled tasks under all four combinations
+and collects them into one comparable, reloadable output:
+
+| Arm id | Tool exposure | Context |
+|---|---|---|
+| `fixed_raw` (baseline) | Fixed | Raw |
+| `fixed_managed` | Fixed | Managed |
+| `adaptive_raw` | Adaptive | Raw |
+| `adaptive_managed` | Adaptive | Managed |
+
+See `docs/step-07-controlled-2x2-experiment.md` for the fairness controls,
+workspace isolation, result schema, and failure-handling categories.
+Statistical analysis of the resulting rows (significance tests, effect
+sizes, dashboards) is Step 8 and is **not** implemented by Step 7.
 
 ### Metrics Collected
 
@@ -223,3 +243,5 @@ against disposable workspaces.
 | `None` ≠ `0` for usage | A metric a provider does not report is recorded as `None`; input and output availability are tracked independently so a real zero is never invented. |
 | Keyword-based classifier for `AdaptiveToolExposure` (Step 5) | Deterministic, explainable, and dependency-free — no embeddings/ML model needed to compare Fixed vs. Adaptive. Deliberately a placeholder: a learned or per-turn selector can replace it later without touching `AgentRuntime`, `ExperimentConfig`, or the tracer. |
 | Turn-based, rule-based `ManagedContextStrategy` (Step 6) | Deterministic and explainable, like Step 5's classifier — no summarisation model, no extra LLM call. Turns (assistant + its tool results) are always kept or dropped atomically so a tool call and its result are never separated. A recent window and any turn containing a failed tool result are always preserved in full; older redundant successful tool output is compressed in place (message kept, content shortened) rather than deleted, so provider-side pairing (by id or by name) never breaks. |
+| `MatrixRunner` as orchestration only, not a second agent loop (Step 7) | Every task-arm execution is exactly one `EvaluationRunner.run()` call (itself one `AgentRuntime.run()` call). Fairness comes from holding provider/model/temperature/limits/task/checks/registry constant across arms and giving each (task, arm) pair its own workspace and provider instance — not from any new execution logic. |
+| A distinct `runner_error` status, separate from `AgentRun` statuses (Step 7) | An orchestration-layer failure (workspace/provider-construction/config problem, before a normal `AgentRun` could even start) must never be confused with a provider error or an in-loop failure that a *normal* run already distinguishes — see `outcome_category()` in `forge/evaluation/matrix.py`. |

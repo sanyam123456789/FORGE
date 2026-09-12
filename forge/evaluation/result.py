@@ -108,6 +108,15 @@ class EvalResult:
     context_items_compressed: int | None = None
     context_chars_saved: int | None = None
 
+    # -- formal 2x2 experiment metadata (Step 7) -----------------------
+    # Populated by forge.evaluation.matrix.MatrixRunner; left at their
+    # defaults (None) for a plain single EvaluationRunner.run() call, which
+    # knows nothing about "experiments" or "arms".
+    experiment_id: str | None = None
+    arm_id: str | None = None
+    task_category: str | None = None
+    exposed_tools: list[str] | None = None
+
     # -- cost (unavailable unless real pricing was supplied) -----------
     cost_available: bool = False
     cost_usd: float | None = None

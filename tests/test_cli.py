@@ -342,3 +342,115 @@ def test_evaluate_unknown_suite_task_id_exits_2(tmp_path, monkeypatch, capsys):
     )
     assert code == 2
     assert "unknown task_id" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# `forge experiment` (Step 7 — formal 2x2 controlled experiment)
+# ---------------------------------------------------------------------------
+
+
+class _RepeatingScripted(LLMProvider):
+    """Always answers with a fixed, no-tool-call response.
+
+    Unlike ``_Scripted`` (a finite queue), this supports an unbounded number
+    of ``complete()`` calls — needed because ``forge experiment`` drives one
+    real agent run per task-arm combination, and the CLI's provider patch
+    (``_patch_provider``) hands out a single shared provider instance.
+    """
+
+    provider_name = "scripted"
+    model_name = "fake-model"
+
+    def __init__(self):
+        self.call_count = 0
+
+    def complete(self, messages, *, tools=None, max_tokens=4096, temperature=0.0):
+        self.call_count += 1
+        return LLMResponse(content="looked, did nothing.", stop_reason="stop")
+
+
+def test_experiment_help_exits_zero():
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["experiment", "-h"])
+    assert exc.value.code == 0
+
+
+def test_experiment_runs_a_task_arm_subset_and_writes_output(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    output_dir = tmp_path / "experiments"
+
+    code = cli.main(
+        [
+            "experiment",
+            "--task-id", "create-string-utils",
+            "--arm", "fixed_raw",
+            "--output-dir", str(output_dir),
+            "--no-trace",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    summary = payload["summary"]
+    assert summary["task_ids"] == ["create-string-utils"]
+    assert summary["arm_ids"] == ["fixed_raw"]
+    assert "fixed_raw" in payload["aggregates"]
+    assert payload["aggregates"]["fixed_raw"]["task_count"] == 1
+
+    exp_dir = output_dir / summary["experiment_id"]
+    assert (exp_dir / "metadata.json").exists()
+    results_lines = (exp_dir / "results.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(results_lines) == 1
+    row = json.loads(results_lines[0])
+    assert row["task_id"] == "create-string-utils"
+    assert row["arm_id"] == "fixed_raw"
+    assert row["tool_strategy"] == "fixed"
+    assert row["context_strategy"] == "raw"
+
+
+def test_experiment_two_arms_two_task_arm_rows(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    output_dir = tmp_path / "experiments"
+
+    code = cli.main(
+        [
+            "experiment",
+            "--task-id", "create-string-utils",
+            "--arm", "fixed_raw",
+            "--arm", "adaptive_managed",
+            "--output-dir", str(output_dir),
+            "--no-trace",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "fixed_raw" in out
+    assert "adaptive_managed" in out
+    assert "2 task-arm result(s)" in out
+
+
+def test_experiment_unknown_task_id_exits_2(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    code = cli.main(
+        [
+            "experiment",
+            "--task-id", "no-such-task",
+            "--output-dir", str(tmp_path / "experiments"),
+            "--no-trace",
+        ]
+    )
+    assert code == 2
+    assert "unknown task_id" in capsys.readouterr().err
+
+
+def test_experiment_unknown_arm_rejected_by_argparse(tmp_path, monkeypatch):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "experiment",
+                "--arm", "banana",
+                "--output-dir", str(tmp_path / "experiments"),
+            ]
+        )
+    assert exc.value.code == 2
