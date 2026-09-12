@@ -5,6 +5,7 @@ forge.cli — minimal command-line entry point.
     forge tasks
     forge evaluate --suite-task-id create-string-utils
     forge experiment --suite-dir experiments/tasks
+    forge analyze --results runs/experiments/<experiment_id>/results.jsonl
 
 `run` executes the agent once and prints a summary.  `tasks` lists the
 version-controlled baseline task suite (``experiments/tasks/``).  `evaluate`
@@ -14,7 +15,12 @@ one task under one controlled strategy configuration and appends a structured
 the formal 2x2 controlled experiment (Step 7): every selected task under all
 four arms (fixed_raw, fixed_managed, adaptive_raw, adaptive_managed), each in
 its own isolated workspace, writing one JSONL results file plus a metadata
-file per experiment run.
+file per experiment run.  `analyze` (Step 8) reads a results JSONL file (and,
+if present, its metadata.json) and writes a reproducible, machine-readable
+statistical comparison across the arms — descriptive statistics and paired
+comparisons only, no p-values or significance labels; see
+docs/step-08-statistical-analysis.md. It never calls a provider or the
+network.
 
 run options:
     --task TEXT              the coding task (required)
@@ -58,15 +64,30 @@ experiment options:
     quick check; see docs/step-07-controlled-2x2-experiment.md for how to
     drive it with a scripted/fake provider instead (as the test suite does).
 
+analyze options:
+    --results PATH           results JSONL file to analyze (required)
+    --metadata PATH          metadata.json path (default: <results dir>/metadata.json if present)
+    --output PATH            where to write the analysis JSON (default: <results dir>/analysis.json)
+    --arm ARM_ID             restrict to this arm (repeatable; default: every arm present in the data)
+    --task-id ID             restrict to this task_id (repeatable; default: every task present in the data)
+    --overwrite              overwrite an existing output file (refused otherwise)
+    --json                   also print the full analysis JSON to stdout
+
+    NOTE: reads only; never calls a provider or the network, and never
+    modifies the source results JSONL. See docs/step-08-statistical-analysis.md.
+
 Exit codes:
     0  run completed (for `experiment`: the batch ran to completion — this
        does not mean every individual task-arm succeeded, only that the
        experiment itself did not fail to run; inspect the written results
-       for per-task-arm outcomes)
+       for per-task-arm outcomes; for `analyze`: the analysis was computed
+       and written — this says nothing about whether the arms it analyzed
+       performed well)
     1  run stopped without completing (limit / provider error / failure) —
        `evaluate` only
     2  configuration problem (e.g. no API key, unimplemented strategy,
-       unknown task/arm id)
+       unknown task/arm id, results file not found, output file already
+       exists without --overwrite)
 """
 
 from __future__ import annotations
@@ -165,6 +186,31 @@ def _build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--temperature", type=float, default=None, help="sampling temperature")
     exp.add_argument("--no-trace", action="store_true", help="do not write per-run JSONL traces")
     exp.add_argument("--json", action="store_true", help="print the experiment summary as JSON")
+
+    an = sub.add_parser(
+        "analyze",
+        help="statistical analysis and comparison of experiment results (Step 8)",
+    )
+    an.add_argument("--results", required=True, help="path to a results JSONL file")
+    an.add_argument(
+        "--metadata", default=None,
+        help="path to metadata.json (default: <results dir>/metadata.json if present)",
+    )
+    an.add_argument(
+        "--output", default=None,
+        help="path to write the analysis JSON (default: <results dir>/analysis.json)",
+    )
+    an.add_argument(
+        "--arm", dest="arm_ids", action="append", default=None,
+        choices=["fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed"],
+        help="restrict analysis to this arm (repeatable; default: every arm present in the data)",
+    )
+    an.add_argument(
+        "--task-id", dest="task_ids", action="append", default=None,
+        help="restrict analysis to this task_id (repeatable; default: every task present in the data)",
+    )
+    an.add_argument("--overwrite", action="store_true", help="overwrite an existing output file")
+    an.add_argument("--json", action="store_true", help="print the full analysis JSON to stdout")
     return parser
 
 
@@ -494,6 +540,73 @@ def _experiment_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _analyze_command(args: argparse.Namespace) -> int:
+    from forge.evaluation.analysis import run_analysis, write_analysis_json
+    from forge.evaluation.matrix import arms_by_ids
+
+    results_path = Path(args.results)
+    if not results_path.exists():
+        print(f"error: results file not found: {results_path}", file=sys.stderr)
+        return 2
+
+    arms: list[str] | None = None
+    if args.arm_ids:
+        try:
+            arms = [a.arm_id for a in arms_by_ids(args.arm_ids)]
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    metadata_path = Path(args.metadata) if args.metadata else None
+
+    try:
+        report = run_analysis(
+            results_path,
+            metadata_path=metadata_path,
+            arms=arms,
+            task_ids=args.task_ids,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    output_path = Path(args.output) if args.output else results_path.parent / "analysis.json"
+    try:
+        write_analysis_json(report, output_path, overwrite=args.overwrite)
+    except FileExistsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return 0
+
+    print(f"FORGE {__version__}  analyze")
+    print(f"results:    {results_path}")
+    print(f"output:     {output_path}")
+    print(f"experiment: {report.experiment_id}")
+    print(f"arms:       {report.arms_analyzed}")
+    print(f"tasks:      {report.task_count}   records: {report.record_count}\n")
+
+    if report.warnings:
+        print(f"{len(report.warnings)} data-quality warning(s)/error(s):")
+        for w in report.warnings[:10]:
+            print(f"  [{w['severity']}] {w['code']}: {w['message']}")
+        if len(report.warnings) > 10:
+            print(f"  ... and {len(report.warnings) - 10} more (see {output_path})")
+        print()
+
+    print(f"  {'arm':<20} {'total':>5} {'success':>7} {'rate':>6}")
+    print(f"  {'-' * 20} {'-' * 5} {'-' * 7} {'-' * 6}")
+    for arm_id in report.arms_analyzed:
+        s = report.outcome_summary.get(arm_id, {})
+        rate = s.get("success_rate_all")
+        rate_str = f"{rate:.0%}" if rate is not None else "n/a"
+        print(f"  {arm_id:<20} {s.get('total', 0):>5} {s.get('success', 0):>7} {rate_str:>6}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -505,6 +618,8 @@ def main(argv: list[str] | None = None) -> int:
         return _evaluate_command(args)
     if args.command == "experiment":
         return _experiment_command(args)
+    if args.command == "analyze":
+        return _analyze_command(args)
     parser.print_help()
     return 0
 

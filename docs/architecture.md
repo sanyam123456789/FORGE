@@ -108,7 +108,8 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. `fixed`/`adaptive` tool strategies (Step 5) and `raw`/`managed` context strategies (Step 6) are all implemented and freely combinable. See `docs/step-03-evaluation.md`, `docs/step-05-adaptive-tool-exposure.md`, `docs/step-06-managed-context.md`. |
 | `forge.evaluation.suite` | Step 4 loader for the version-controlled baseline task suite in `experiments/tasks/` (→ ordinary `EvalTask`s, with fixtures provisioned into the run workspace). See `docs/step-04-baseline-tasks.md`. |
 | `forge.evaluation.matrix` | Step 7 formal 2x2 controlled experiment: `ExperimentArm`, `ARMS`, `MatrixRunner` runs every selected task under every arm (`fixed_raw`, `fixed_managed`, `adaptive_raw`, `adaptive_managed`), each in its own isolated workspace, and writes one reloadable JSONL results file + a metadata file per experiment. Orchestration only — every task-arm execution is one `EvaluationRunner.run()` call. See `docs/step-07-controlled-2x2-experiment.md`. |
-| `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`, `forge experiment` (the 2x2 matrix). |
+| `forge.evaluation.analysis` | Step 8 statistical analysis: reads a Step 7 `results.jsonl` (+ optional `metadata.json`) and computes outcome/metric summaries, paired task comparisons, factor-level (tool exposure / context strategy / interaction) comparisons, and a stdlib-only Wilcoxon signed-rank *statistic* — descriptive only, no p-values/significance labels. No agent loop, no provider or network call. See `docs/step-08-statistical-analysis.md`. |
+| `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`, `forge experiment` (the 2x2 matrix), `forge analyze` (Step 8 comparison). |
 
 ---
 
@@ -165,8 +166,16 @@ and collects them into one comparable, reloadable output:
 
 See `docs/step-07-controlled-2x2-experiment.md` for the fairness controls,
 workspace isolation, result schema, and failure-handling categories.
-Statistical analysis of the resulting rows (significance tests, effect
-sizes, dashboards) is Step 8 and is **not** implemented by Step 7.
+
+Step 8 (`forge.evaluation.analysis`, `forge analyze`) reads that output and
+computes the comparison: per-arm outcome/metric summaries, paired task
+differences, factor-level (tool exposure / context strategy / interaction)
+comparisons, and a real, stdlib-only Wilcoxon signed-rank statistic where the
+data supports it. It never computes or prints a p-value, confidence
+interval, effect size, or "significant" label — see
+`docs/step-08-statistical-analysis.md` §7 for why. Still not implemented by
+Step 8: dashboards/charts, ML/LLM-based analysis, SWE-bench, external-agent
+comparison.
 
 ### Metrics Collected
 

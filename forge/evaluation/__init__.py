@@ -30,11 +30,39 @@ combinations are selectable and runnable. ``forge.evaluation.matrix``
 (Step 7) runs the same tasks under all four arms (``fixed_raw``,
 ``fixed_managed``, ``adaptive_raw``, ``adaptive_managed``) and collects
 comparable, reloadable ``EvalResult`` rows — see
-``docs/step-07-controlled-2x2-experiment.md``. Statistical analysis of those
-results is Step 8 and is NOT implemented here.
+``docs/step-07-controlled-2x2-experiment.md``. ``forge.evaluation.analysis``
+(Step 8) turns those rows into a reproducible statistical comparison across
+the four arms — see ``docs/step-08-statistical-analysis.md``.
 """
 
 from __future__ import annotations
+
+from forge.evaluation.analysis import (
+    ANALYSIS_SCHEMA_VERSION,
+    NUMERIC_METRICS,
+    AnalysisReport,
+    DataQualityIssue,
+    InteractionSummary,
+    MetricSummary,
+    OutcomeSummary,
+    PairedMetricComparison,
+    SuccessDiscordance,
+    WilcoxonResult,
+    analyze,
+    check_matrix_completeness,
+    group_by_arm,
+    group_by_task,
+    interaction_effect,
+    paired_metric_comparison,
+    read_analysis_json,
+    run_analysis,
+    success_discordance,
+    summarize_metric,
+    summarize_outcomes,
+    validate_results,
+    wilcoxon_paired_metric,
+    write_analysis_json,
+)
 
 from forge.evaluation.aggregate import (
     AggregateStats,
@@ -140,4 +168,29 @@ __all__ = [
     "read_matrix_metadata",
     "outcome_category",
     "STATUS_RUNNER_ERROR",
+    # statistical analysis and comparison (Step 8)
+    "ANALYSIS_SCHEMA_VERSION",
+    "NUMERIC_METRICS",
+    "AnalysisReport",
+    "DataQualityIssue",
+    "InteractionSummary",
+    "MetricSummary",
+    "OutcomeSummary",
+    "PairedMetricComparison",
+    "SuccessDiscordance",
+    "WilcoxonResult",
+    "analyze",
+    "check_matrix_completeness",
+    "group_by_arm",
+    "group_by_task",
+    "interaction_effect",
+    "paired_metric_comparison",
+    "read_analysis_json",
+    "run_analysis",
+    "success_discordance",
+    "summarize_metric",
+    "summarize_outcomes",
+    "validate_results",
+    "wilcoxon_paired_metric",
+    "write_analysis_json",
 ]

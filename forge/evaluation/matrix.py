@@ -17,8 +17,12 @@ loop and does not call a provider SDK directly: for every (task, arm) pair it
 builds a fresh, isolated workspace and a fresh provider instance, then hands
 off to ``EvaluationRunner.run()`` exactly as any other caller would.
 
-Step 8 (statistical analysis, dashboards) is explicitly NOT implemented here
-— see ``docs/step-07-controlled-2x2-experiment.md``.
+Statistical analysis of this module's output is ``forge.evaluation.analysis``
+(Step 8) — a separate, read-only consumer of ``results.jsonl``/
+``metadata.json`` that does not change anything in this module. Dashboards
+remain explicitly NOT implemented anywhere. See
+``docs/step-07-controlled-2x2-experiment.md`` and
+``docs/step-08-statistical-analysis.md``.
 """
 
 from __future__ import annotations

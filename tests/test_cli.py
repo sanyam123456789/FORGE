@@ -454,3 +454,147 @@ def test_experiment_unknown_arm_rejected_by_argparse(tmp_path, monkeypatch):
             ]
         )
     assert exc.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# `forge analyze` (Step 8 — statistical analysis and comparison)
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_help_exits_zero():
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["analyze", "-h"])
+    assert exc.value.code == 0
+
+
+def test_analyze_missing_results_file_exits_2(tmp_path, capsys):
+    code = cli.main(["analyze", "--results", str(tmp_path / "nope.jsonl")])
+    assert code == 2
+    assert "not found" in capsys.readouterr().err
+
+
+def test_analyze_runs_on_experiment_output(tmp_path, monkeypatch, capsys):
+    """End-to-end: `forge experiment` then `forge analyze` on its output."""
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    output_dir = tmp_path / "experiments"
+
+    code = cli.main(
+        [
+            "experiment",
+            "--task-id", "create-string-utils",
+            "--output-dir", str(output_dir),
+            "--no-trace",
+            "--json",
+        ]
+    )
+    assert code == 0
+    exp_payload = json.loads(capsys.readouterr().out)
+    exp_dir = output_dir / exp_payload["summary"]["experiment_id"]
+    results_file = exp_dir / "results.jsonl"
+    before = results_file.read_text(encoding="utf-8")
+
+    analysis_out = tmp_path / "analysis.json"
+    code = cli.main(
+        [
+            "analyze",
+            "--results", str(results_file),
+            "--output", str(analysis_out),
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["record_count"] == 4  # one task x four arms
+    assert set(payload["arms_analyzed"]) == {
+        "fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed",
+    }
+    assert payload["metadata"]["experiment_id"] == exp_payload["summary"]["experiment_id"]
+    assert analysis_out.exists()
+    reloaded = json.loads(analysis_out.read_text(encoding="utf-8"))
+    assert reloaded["record_count"] == 4
+    # source results file untouched
+    assert results_file.read_text(encoding="utf-8") == before
+
+
+def test_analyze_refuses_to_overwrite_without_flag(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    output_dir = tmp_path / "experiments"
+    cli.main(
+        [
+            "experiment", "--task-id", "create-string-utils",
+            "--arm", "fixed_raw", "--output-dir", str(output_dir), "--no-trace",
+        ]
+    )
+    capsys.readouterr()
+    exp_dirs = list(output_dir.iterdir())
+    results_file = exp_dirs[0] / "results.jsonl"
+    analysis_out = tmp_path / "analysis.json"
+
+    code = cli.main(["analyze", "--results", str(results_file), "--output", str(analysis_out)])
+    assert code == 0
+    capsys.readouterr()
+
+    code = cli.main(["analyze", "--results", str(results_file), "--output", str(analysis_out)])
+    assert code == 2
+    assert "already exists" in capsys.readouterr().err
+
+    code = cli.main(
+        ["analyze", "--results", str(results_file), "--output", str(analysis_out), "--overwrite"]
+    )
+    assert code == 0
+
+
+def test_analyze_arm_and_task_filters(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    output_dir = tmp_path / "experiments"
+    cli.main(
+        [
+            "experiment", "--task-id", "create-string-utils",
+            "--output-dir", str(output_dir), "--no-trace",
+        ]
+    )
+    capsys.readouterr()
+    exp_dirs = list(output_dir.iterdir())
+    results_file = exp_dirs[0] / "results.jsonl"
+
+    code = cli.main(
+        [
+            "analyze",
+            "--results", str(results_file),
+            "--output", str(tmp_path / "partial.json"),
+            "--arm", "fixed_raw",
+            "--arm", "adaptive_managed",
+            "--task-id", "create-string-utils",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["arms_analyzed"] == ["fixed_raw", "adaptive_managed"]
+    assert payload["record_count"] == 2
+
+
+def test_analyze_default_output_path(tmp_path, monkeypatch, capsys):
+    _patch_provider(monkeypatch, _RepeatingScripted())
+    output_dir = tmp_path / "experiments"
+    cli.main(
+        [
+            "experiment", "--task-id", "create-string-utils",
+            "--arm", "fixed_raw", "--output-dir", str(output_dir), "--no-trace",
+        ]
+    )
+    capsys.readouterr()
+    exp_dir = list(output_dir.iterdir())[0]
+    results_file = exp_dir / "results.jsonl"
+
+    code = cli.main(["analyze", "--results", str(results_file)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "analyze" in out
+    assert (exp_dir / "analysis.json").exists()
+
+
+def test_analyze_unknown_arm_rejected_by_argparse(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["analyze", "--results", str(tmp_path / "x.jsonl"), "--arm", "banana"])
+    assert exc.value.code == 2

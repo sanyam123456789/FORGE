@@ -309,8 +309,11 @@ locally first.
   deliberate — inspecting what each arm actually produced is often the
   point — but means a large experiment leaves a lot of on-disk state under
   `<output_dir>/<experiment_id>/workspaces/`.
-* **No statistical analysis.** Step 7 produces comparable rows; it does not
-  compute significance, confidence intervals, or effect sizes over them.
+* **No statistical analysis in this step.** Step 7 produces comparable rows;
+  it does not itself compute significance, confidence intervals, or effect
+  sizes over them. `forge.evaluation.analysis` (Step 8) consumes this step's
+  output separately and still never computes those three things — see
+  `docs/step-08-statistical-analysis.md` §7.
 * **No dashboards or charts.** Only JSON/JSONL output and a small CLI text
   table.
 * **No WhatsApp/Telegram integration.**
@@ -324,7 +327,9 @@ locally first.
 ## 12. Explicitly deferred
 
 * Step 8 (statistical analysis of the `EvalResult` rows this step produces)
-  is **not implemented**.
+  is now implemented — see `forge.evaluation.analysis` and
+  `docs/step-08-statistical-analysis.md`. It reads this step's
+  `results.jsonl`/`metadata.json` only; nothing in this document changed.
 * Dashboards/charts are **not implemented**.
 * WhatsApp/Telegram integration is **not implemented**.
 * Pi integration is **not implemented**.
