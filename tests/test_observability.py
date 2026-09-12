@@ -78,6 +78,58 @@ class TestRunTracer:
         assert event.data["message_count"] == 2
         assert event.data["exposed_tool_count"] == 1
 
+    def test_record_llm_request_without_context_stats_stays_none_safe(self, tracer):
+        # No ContextStrategy report supplied (e.g. a future strategy that
+        # doesn't implement last_report()) -> fields present but None, and
+        # the cumulative context properties stay unavailable (None), never
+        # fabricated as 0.
+        tracer.record_llm_request(turn=1, message_count=2)
+        event = tracer._events[0]
+        assert event.data["context_items_before"] is None
+        assert event.data["context_items_dropped"] is None
+        assert tracer.context_items_dropped_total is None
+        assert tracer.context_items_compressed_total is None
+        assert tracer.context_chars_saved_total is None
+
+    def test_record_llm_request_context_stats_recorded_and_accumulated(self, tracer):
+        tracer.record_llm_request(
+            turn=1,
+            message_count=4,
+            context_items_before=10,
+            context_items_after=4,
+            context_chars_before=500,
+            context_chars_after=100,
+            context_items_dropped=4,
+            context_items_compressed=2,
+        )
+        event = tracer._events[0]
+        assert event.data["context_items_before"] == 10
+        assert event.data["context_items_after"] == 4
+        assert event.data["context_chars_before"] == 500
+        assert event.data["context_chars_after"] == 100
+        assert event.data["context_items_dropped"] == 4
+        assert event.data["context_items_compressed"] == 2
+
+        # A second turn with a smaller reduction accumulates on top.
+        tracer.record_llm_request(
+            turn=2,
+            message_count=6,
+            context_items_before=8,
+            context_items_after=6,
+            context_chars_before=300,
+            context_chars_after=250,
+            context_items_dropped=1,
+            context_items_compressed=1,
+        )
+        assert tracer.context_items_dropped_total == 5
+        assert tracer.context_items_compressed_total == 3
+        assert tracer.context_chars_saved_total == 400 + 50
+
+        summary = tracer.summary(status="completed")
+        assert summary.context_items_dropped == 5
+        assert summary.context_items_compressed == 3
+        assert summary.context_chars_saved == 450
+
     def test_record_llm_response_increments_and_accumulates(self, tracer):
         tracer.record_llm_response(input_tokens=100, output_tokens=50, latency_ms=200.0)
         assert tracer._llm_calls == 1

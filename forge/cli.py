@@ -31,7 +31,7 @@ evaluate options:
     --task-id ID             override the stable task identity
     --suite-dir PATH         suite dir for --suite-task-id
     --tool-strategy NAME     fixed | adaptive (both implemented)
-    --context-strategy NAME  raw   (only implemented value; managed is not yet implemented)
+    --context-strategy NAME  raw | managed (both implemented)
     --workspace PATH         reuse a workspace (default: temp dir, cleaned)
     --results-file PATH      JSONL to append the result to
     --model / --max-turns / --max-tool-calls / --temperature / --no-trace / --json
@@ -94,7 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument(
         "--context-strategy", default="raw",
-        help="context strategy (implemented: raw)",
+        help="context strategy (implemented: raw, managed)",
     )
     ev.add_argument("--workspace", default=None, help="reuse this workspace (default: temp dir, cleaned)")
     ev.add_argument("--model", default=None, help="override the model name")
@@ -260,23 +260,25 @@ def _evaluate_command(args: argparse.Namespace) -> int:
         print(f"error: could not load task: {exc}", file=sys.stderr)
         return 2
 
-    experiment = ExperimentConfig.from_settings(
-        settings,
-        task_id=task.task_id,
-        tool_strategy=args.tool_strategy,
-        context_strategy=args.context_strategy,
-        max_llm_turns=args.max_turns,
-        max_tool_calls=args.max_tool_calls,
-        label=args.label,
-    )
-    if args.temperature is not None:
-        experiment = ExperimentConfig.from_dict(
-            {**experiment.to_dict(), "temperature": args.temperature}
-        )
-
-    # Fail fast (exit 2) on unimplemented strategy or provider/key problems,
-    # exactly like `forge run`.
+    # Fail fast (exit 2) on an unknown/unimplemented strategy name or a
+    # provider/key problem, exactly like `forge run`. Building the
+    # ExperimentConfig is included here (not just resolve_strategies())
+    # because an unrecognised --tool-strategy/--context-strategy value
+    # raises ValueError at construction time, in __post_init__.
     try:
+        experiment = ExperimentConfig.from_settings(
+            settings,
+            task_id=task.task_id,
+            tool_strategy=args.tool_strategy,
+            context_strategy=args.context_strategy,
+            max_llm_turns=args.max_turns,
+            max_tool_calls=args.max_tool_calls,
+            label=args.label,
+        )
+        if args.temperature is not None:
+            experiment = ExperimentConfig.from_dict(
+                {**experiment.to_dict(), "temperature": args.temperature}
+            )
         experiment.resolve_strategies()
         provider = get_provider(settings_override=settings)
         provider.preflight()
@@ -318,7 +320,8 @@ def _evaluate_command(args: argparse.Namespace) -> int:
             "context_strategy", "llm_calls", "tool_calls", "input_tokens",
             "output_tokens", "total_tokens", "reasoning_tokens",
             "cached_input_tokens", "latency_ms", "cost_usd", "cost_available",
-            "context_messages", "context_char_count", "checks_run",
+            "context_messages", "context_char_count", "context_items_dropped",
+            "context_items_compressed", "context_chars_saved", "checks_run",
             "checks_passed", "duration_s", "trace_path",
         ]
         print("--- eval result ---")

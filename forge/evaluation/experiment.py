@@ -2,20 +2,20 @@
 forge.evaluation.experiment — the controlled configuration for one eval run.
 
 An ``ExperimentConfig`` is the single object that pins every variable held
-constant during the research comparison, plus the two that will vary:
+constant during the research comparison, plus the two that vary:
 
     held constant : provider, model, temperature, max_output_tokens,
                     max_llm_turns, max_tool_calls, the task
-    varied        : tool_strategy  (fixed  |  adaptive)
-    varied later  : context_strategy (raw  -> managed)
+    varied        : tool_strategy    (fixed    | adaptive)
+    varied        : context_strategy (raw      | managed)
 
-As of Step 5, both ``fixed`` and ``adaptive`` tool strategies are
-implemented and may be freely combined with the ``raw`` context strategy.
-``managed`` context remains a recognised name only (so a future result file
-is unambiguous) — ``resolve_strategies()`` still raises
-``NotImplementedError`` for it. This package measures; it does not add
-agent behaviour beyond selecting the strategy objects the real
-``AgentRuntime`` already knows how to use.
+As of Step 6, ``fixed``/``adaptive`` tool strategies and ``raw``/``managed``
+context strategies are all implemented, so all four combinations
+(fixed+raw, fixed+managed, adaptive+raw, adaptive+managed) are selectable
+and runnable. This package measures; it does not add agent behaviour beyond
+selecting the strategy objects the real ``AgentRuntime`` already knows how
+to use. The formal 2x2 controlled experiment (many tasks, repeated runs,
+statistical comparison) is Step 7 and is NOT implemented here.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from forge.context import ContextStrategy, RawContextStrategy
+from forge.context import ContextStrategy, ManagedContextStrategy, RawContextStrategy
 from forge.tools import AdaptiveToolExposure, FixedToolExposure, ToolExposureStrategy
 
 # --- Strategy identifiers -------------------------------------------------
@@ -38,11 +38,13 @@ CONTEXT_STRATEGY_MANAGED = "managed"
 IMPLEMENTED_TOOL_STRATEGIES: frozenset[str] = frozenset(
     {TOOL_STRATEGY_FIXED, TOOL_STRATEGY_ADAPTIVE}
 )
-IMPLEMENTED_CONTEXT_STRATEGIES: frozenset[str] = frozenset({CONTEXT_STRATEGY_RAW})
+IMPLEMENTED_CONTEXT_STRATEGIES: frozenset[str] = frozenset(
+    {CONTEXT_STRATEGY_RAW, CONTEXT_STRATEGY_MANAGED}
+)
 
 #: Strategies that are planned but NOT implemented — allowed as labels only.
 FUTURE_TOOL_STRATEGIES: frozenset[str] = frozenset()
-FUTURE_CONTEXT_STRATEGIES: frozenset[str] = frozenset({CONTEXT_STRATEGY_MANAGED})
+FUTURE_CONTEXT_STRATEGIES: frozenset[str] = frozenset()
 
 _KNOWN_TOOL_STRATEGIES = IMPLEMENTED_TOOL_STRATEGIES | FUTURE_TOOL_STRATEGIES
 _KNOWN_CONTEXT_STRATEGIES = IMPLEMENTED_CONTEXT_STRATEGIES | FUTURE_CONTEXT_STRATEGIES
@@ -142,7 +144,12 @@ class ExperimentConfig:
             if self.tool_strategy == TOOL_STRATEGY_ADAPTIVE
             else FixedToolExposure()
         )
-        return tool_exposure, RawContextStrategy()
+        context_strategy: ContextStrategy = (
+            ManagedContextStrategy()
+            if self.context_strategy == CONTEXT_STRATEGY_MANAGED
+            else RawContextStrategy()
+        )
+        return tool_exposure, context_strategy
 
     # -- serialisation ---------------------------------------------------
 

@@ -83,6 +83,9 @@ class RunSummary:
     context_strategy: str | None
     system_prompt_id: str | None
     error: str | None
+    context_items_dropped: int | None = None
+    context_items_compressed: int | None = None
+    context_chars_saved: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +133,16 @@ class RunTracer:
 
         # Latency accumulator (only counts turns that reported a latency).
         self._latency_ms: float | None = None
+
+        # Managed-context accumulators (Step 6) — cumulative across turns,
+        # only advanced when a turn actually supplies a ContextReport (Raw
+        # supplies a trivial one every turn; a future strategy that reports
+        # nothing at all simply never advances these, and they stay 0/None
+        # in the summary via ``context_report_available``).
+        self._context_report_seen: bool = False
+        self._context_items_dropped_total: int = 0
+        self._context_items_compressed_total: int = 0
+        self._context_chars_saved_total: int = 0
 
     # ------------------------------------------------------------------
     # Event recorders
@@ -183,7 +196,21 @@ class RunTracer:
         turn: int,
         message_count: int,
         exposed_tools: list[str] | None = None,
+        context_items_before: int | None = None,
+        context_items_after: int | None = None,
+        context_chars_before: int | None = None,
+        context_chars_after: int | None = None,
+        context_items_dropped: int | None = None,
+        context_items_compressed: int | None = None,
     ) -> None:
+        if context_items_before is not None:
+            self._context_report_seen = True
+            self._context_items_dropped_total += context_items_dropped or 0
+            self._context_items_compressed_total += context_items_compressed or 0
+            if context_chars_before is not None and context_chars_after is not None:
+                self._context_chars_saved_total += max(
+                    context_chars_before - context_chars_after, 0
+                )
         self._events.append(
             RunEvent(
                 event_type=LLM_CALL,
@@ -192,6 +219,12 @@ class RunTracer:
                     "message_count": message_count,
                     "exposed_tool_count": len(exposed_tools) if exposed_tools is not None else None,
                     "exposed_tools": exposed_tools,
+                    "context_items_before": context_items_before,
+                    "context_items_after": context_items_after,
+                    "context_chars_before": context_chars_before,
+                    "context_chars_after": context_chars_after,
+                    "context_items_dropped": context_items_dropped,
+                    "context_items_compressed": context_items_compressed,
                 },
             )
         )
@@ -302,6 +335,9 @@ class RunTracer:
                     "llm_latency_ms": self._latency_ms,
                     "final_answer_preview": final_answer[:200],
                     "error": error,
+                    "context_items_dropped": self.context_items_dropped_total,
+                    "context_items_compressed": self.context_items_compressed_total,
+                    "context_chars_saved": self.context_chars_saved_total,
                 },
             )
         )
@@ -322,6 +358,24 @@ class RunTracer:
         if self._input_tokens is not None and self._output_tokens is not None:
             return self._input_tokens + self._output_tokens
         return None
+
+    @property
+    def context_items_dropped_total(self) -> int | None:
+        """Cumulative messages dropped by the context strategy across turns.
+
+        ``None`` when no turn ever supplied a ``ContextReport`` (a strategy
+        that implements ``last_report()`` as ``None``) rather than a
+        fabricated ``0``.
+        """
+        return self._context_items_dropped_total if self._context_report_seen else None
+
+    @property
+    def context_items_compressed_total(self) -> int | None:
+        return self._context_items_compressed_total if self._context_report_seen else None
+
+    @property
+    def context_chars_saved_total(self) -> int | None:
+        return self._context_chars_saved_total if self._context_report_seen else None
 
     # ------------------------------------------------------------------
     # Summary and persistence
@@ -348,6 +402,9 @@ class RunTracer:
             context_strategy=self._meta.get("context_strategy"),
             system_prompt_id=self._meta.get("system_prompt_id"),
             error=error,
+            context_items_dropped=self.context_items_dropped_total,
+            context_items_compressed=self.context_items_compressed_total,
+            context_chars_saved=self.context_chars_saved_total,
         )
 
     def flush(self, log_dir: Path) -> Path:

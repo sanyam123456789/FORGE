@@ -102,6 +102,12 @@ class EvalResult:
     context_messages: int | None = None
     context_char_count: int | None = None
 
+    # managed-context stats (Step 6) — cumulative across the run; None when
+    # the context strategy never reported (see forge.context.ContextReport).
+    context_items_dropped: int | None = None
+    context_items_compressed: int | None = None
+    context_chars_saved: int | None = None
+
     # -- cost (unavailable unless real pricing was supplied) -----------
     cost_available: bool = False
     cost_usd: float | None = None

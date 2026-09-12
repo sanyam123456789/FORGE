@@ -105,6 +105,13 @@ class AgentRun:
     context_messages: int = 0
     context_char_count: int = 0
 
+    # Managed-context stats (Step 6) — cumulative across turns, from the
+    # context strategy's own ContextReport. None when the strategy never
+    # reported one (see RunTracer.context_items_dropped_total).
+    context_items_dropped: int | None = None
+    context_items_compressed: int | None = None
+    context_chars_saved: int | None = None
+
     # Timing / artefacts.
     llm_latency_ms: float | None = None
     trace_path: Path | None = None
@@ -203,11 +210,30 @@ class AgentRuntime:
                 )
                 schemas = registry.get_schemas(subset)
                 prepared = cfg.context_strategy.prepare(ctx)
+                context_report = cfg.context_strategy.last_report()
 
                 tracer.record_llm_request(
                     turn=turn,
                     message_count=len(prepared),
                     exposed_tools=exposed_names,
+                    context_items_before=(
+                        context_report.items_before if context_report else None
+                    ),
+                    context_items_after=(
+                        context_report.items_after if context_report else None
+                    ),
+                    context_chars_before=(
+                        context_report.chars_before if context_report else None
+                    ),
+                    context_chars_after=(
+                        context_report.chars_after if context_report else None
+                    ),
+                    context_items_dropped=(
+                        context_report.items_dropped if context_report else None
+                    ),
+                    context_items_compressed=(
+                        context_report.items_compressed if context_report else None
+                    ),
                 )
 
                 try:
@@ -299,6 +325,9 @@ class AgentRuntime:
         finally:
             run.context_messages = ctx.message_count
             run.context_char_count = ctx.approximate_char_count
+            run.context_items_dropped = tracer.context_items_dropped_total
+            run.context_items_compressed = tracer.context_items_compressed_total
+            run.context_chars_saved = tracer.context_chars_saved_total
             tracer.record_run_end(
                 status=run.status,
                 final_answer=run.final_answer,

@@ -24,10 +24,11 @@ The Step 4 baseline task suite (``experiments/tasks/*.json``) is loaded by
 ``forge.evaluation.suite`` into the same ``EvalTask`` type — no parallel
 abstraction.
 
-Both the ``fixed`` and ``adaptive`` tool strategies are implemented (Step 5)
-and may run under the ``raw`` context strategy. ``managed`` context is named
-here so a future result file can be compared unambiguously, but requesting it
-raises ``NotImplementedError`` — Managed Context is not implemented yet.
+Both the ``fixed``/``adaptive`` tool strategies (Step 5) and the
+``raw``/``managed`` context strategies (Step 6) are implemented, so all four
+combinations are selectable and runnable. The formal 2x2 controlled
+experiment (many tasks, repeated runs, statistical comparison) is Step 7 and
+is NOT implemented here.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ from forge.evaluation.aggregate import (
     group_results,
 )
 from forge.evaluation.experiment import (
+    CONTEXT_STRATEGY_MANAGED,
     CONTEXT_STRATEGY_RAW,
     FUTURE_CONTEXT_STRATEGIES,
     FUTURE_TOOL_STRATEGIES,
@@ -90,6 +92,7 @@ __all__ = [
     "TOOL_STRATEGY_FIXED",
     "TOOL_STRATEGY_ADAPTIVE",
     "CONTEXT_STRATEGY_RAW",
+    "CONTEXT_STRATEGY_MANAGED",
     "IMPLEMENTED_TOOL_STRATEGIES",
     "IMPLEMENTED_CONTEXT_STRATEGIES",
     "FUTURE_TOOL_STRATEGIES",

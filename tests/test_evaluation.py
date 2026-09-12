@@ -205,13 +205,23 @@ class TestExperimentConfig:
         assert tool_strat.name == "adaptive"
         assert ctx_strat.name == "raw"
 
-    def test_managed_context_strategy_is_not_runnable(self):
-        # Managed Context is out of scope for Step 5 and remains unimplemented.
+    def test_managed_context_strategy_is_implemented(self):
+        # Step 6: managed context is now a real, runnable strategy.
         managed = _experiment(context_strategy="managed")
-        assert managed.is_implemented is False
+        assert managed.is_implemented is True
         assert managed.strategy_key == "fixed+managed"
-        with pytest.raises(NotImplementedError):
-            managed.resolve_strategies()
+        tool_strat, ctx_strat = managed.resolve_strategies()
+        assert tool_strat.name == "fixed"
+        assert ctx_strat.name == "managed"
+
+    def test_adaptive_and_managed_combine(self):
+        # All four cells of the eventual 2x2 are individually resolvable.
+        both = _experiment(tool_strategy="adaptive", context_strategy="managed")
+        assert both.is_implemented is True
+        assert both.strategy_key == "adaptive+managed"
+        tool_strat, ctx_strat = both.resolve_strategies()
+        assert tool_strat.name == "adaptive"
+        assert ctx_strat.name == "managed"
 
     def test_to_from_dict_roundtrip(self):
         exp = _experiment(label="pilot")
@@ -309,12 +319,65 @@ class TestEvaluationRunner:
         assert result.workspace is not None
         assert not Path(result.workspace).exists()  # auto-removed
 
-    def test_unimplemented_strategy_raises_not_implemented(self, tmp_path):
-        # Managed Context remains unimplemented in Step 5.
+    def test_unknown_context_strategy_rejected_before_running(self, tmp_path):
+        # An unrecognised strategy name is rejected at ExperimentConfig
+        # construction (ValueError), long before the runner would run
+        # anything — see TestExperimentConfig.test_unknown_strategy_rejected.
+        with pytest.raises(ValueError):
+            _experiment(context_strategy="banana")
+
+    def test_run_with_managed_context_strategy(self, tmp_path):
+        # Step 6: Fixed + Managed runs the real agent loop end-to-end.
+        provider = _write_calc_then_done(
+            input_tokens=120, output_tokens=30, total_tokens=150
+        )
+        runner = EvaluationRunner(
+            settings=_SETTINGS, provider=provider, trace_dir=tmp_path / "traces"
+        )
+        result = runner.run(
+            _calc_task(), _experiment(context_strategy="managed"), workspace=tmp_path / "ws"
+        )
+        assert result.status == "completed"
+        assert result.success is True
+        assert result.tool_strategy == "fixed"
+        assert result.context_strategy == "managed"
+        # a short, two-turn run never triggers compression/dropping, but the
+        # strategy still reports (None-safe: 0, not fabricated).
+        assert result.context_items_dropped == 0
+        assert result.context_items_compressed == 0
+        assert result.context_chars_saved == 0
+
+    def test_run_with_adaptive_and_managed_strategies(self, tmp_path):
+        # Step 6: Adaptive + Managed — the fourth cell of the eventual 2x2 —
+        # runs the real agent loop end-to-end.
+        task = EvalTask(
+            task_id="calc-create",
+            prompt=(
+                "Create a new file named calculator.py with add(a, b) and "
+                "multiply(a, b)."
+            ),
+            checks=(
+                ArtifactCheck(
+                    path="calculator.py",
+                    must_contain=("def add(a, b)", "def multiply(a, b)"),
+                ),
+            ),
+        )
         provider = _write_calc_then_done()
-        runner = EvaluationRunner(settings=_SETTINGS, provider=provider, write_trace=False)
-        with pytest.raises(NotImplementedError):
-            runner.run(_calc_task(), _experiment(context_strategy="managed"))
+        runner = EvaluationRunner(
+            settings=_SETTINGS, provider=provider, trace_dir=tmp_path / "traces"
+        )
+        result = runner.run(
+            task,
+            _experiment(
+                task_id=task.task_id, tool_strategy="adaptive", context_strategy="managed"
+            ),
+            workspace=tmp_path / "ws",
+        )
+        assert result.status == "completed"
+        assert result.success is True
+        assert result.tool_strategy == "adaptive"
+        assert result.context_strategy == "managed"
 
     def test_run_with_adaptive_tool_strategy_narrows_exposed_tools(self, tmp_path):
         # A prompt that matches the "create" keyword rule (see

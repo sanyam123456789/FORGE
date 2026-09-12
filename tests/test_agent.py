@@ -21,6 +21,7 @@ from forge.agent import (
     AgentRuntime,
 )
 from forge.builtin_tools import build_default_registry
+from forge.context import ManagedContextStrategy, RawContextStrategy
 from forge.llm import LLMError, LLMProvider, LLMResponse, ToolCall
 from forge.tools import AdaptiveToolExposure, FixedToolExposure
 
@@ -453,6 +454,119 @@ class TestAdaptiveToolExposureEndToEnd:
         assert run.status == STATUS_COMPLETED
         names = {t["function"]["name"] for t in provider.calls[0]["tools"]}
         assert names == set(registry.list_names())
+
+
+# ---------------------------------------------------------------------------
+# Managed context strategy (Step 6) — the loop is unmodified except for
+# forwarding ContextStrategy.last_report() to the tracer; only the strategy
+# object passed in via AgentConfig.context_strategy changes.
+# ---------------------------------------------------------------------------
+
+
+class TestRawContextRegression:
+    """Fixed+Raw and Adaptive+Raw traces must be unaffected by Step 6."""
+
+    def _events(self, run):
+        return [
+            json.loads(line)
+            for line in run.trace_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def test_raw_strategy_reports_no_reduction(self, registry, tmp_path):
+        provider = ScriptedProvider([_tool("list_directory", {}), _text("done")])
+        run = _runtime(AgentConfig(task="t"), provider, registry, tmp_path).run()
+        assert run.status == STATUS_COMPLETED
+
+        # RawContextStrategy is the AgentConfig default; nothing is ever
+        # dropped or compressed.
+        assert run.context_items_dropped == 0
+        assert run.context_items_compressed == 0
+        assert run.context_chars_saved == 0
+
+        llm_calls = [e for e in self._events(run) if e["event_type"] == "llm_call"]
+        for event in llm_calls:
+            data = event["data"]
+            assert data["context_items_before"] == data["context_items_after"]
+            assert data["context_chars_before"] == data["context_chars_after"]
+            assert data["context_items_dropped"] == 0
+            assert data["context_items_compressed"] == 0
+
+
+class TestManagedContextEndToEnd:
+    def test_short_run_under_managed_context_is_unreduced(self, registry, tmp_path):
+        # A run shorter than the default recent window (3 turns) behaves
+        # exactly like Raw: nothing to prune yet.
+        provider = ScriptedProvider([_tool("list_directory", {}), _text("done")])
+        config = AgentConfig(task="t", context_strategy=ManagedContextStrategy())
+        run = _runtime(config, provider, registry, tmp_path).run()
+        assert run.status == STATUS_COMPLETED
+        assert run.context_items_dropped == 0
+        assert run.context_items_compressed == 0
+
+    def test_long_run_triggers_compression_and_budget_dropping(self, registry, tmp_path):
+        # Six list_directory round-trips, well past keep_recent_turns=1 and
+        # the tiny max_messages budget — this must exercise both
+        # compression and hard-budget dropping inside the real agent loop.
+        responses = [
+            _tool("list_directory", {}, call_id=f"c{i}") for i in range(6)
+        ] + [_text("done")]
+        provider = ScriptedProvider(responses)
+        config = AgentConfig(
+            task="t",
+            context_strategy=ManagedContextStrategy(
+                keep_recent_turns=1, max_messages=6, max_chars=100_000
+            ),
+        )
+        run = _runtime(config, provider, registry, tmp_path).run()
+
+        assert run.status == STATUS_COMPLETED
+        assert run.context_items_dropped is not None
+        assert run.context_items_dropped > 0
+
+        events = [
+            json.loads(line)
+            for line in run.trace_path.read_text(encoding="utf-8").splitlines()
+        ]
+        llm_calls = [e for e in events if e["event_type"] == "llm_call"]
+        # The final turn's request must already be within (or very close to)
+        # the configured message budget.
+        last = llm_calls[-1]["data"]
+        assert last["context_items_before"] > last["context_items_after"]
+        assert last["message_count"] == last["context_items_after"]
+
+    def test_fixed_plus_managed_end_to_end_completes(self, registry, tmp_path):
+        provider = ScriptedProvider(
+            [
+                _tool(
+                    "write_file",
+                    {"path": "add.py", "content": "def add(a, b):\n    return a + b\n"},
+                ),
+                _text("Created add.py."),
+            ]
+        )
+        config = AgentConfig(task="create add.py", context_strategy=ManagedContextStrategy())
+        run = _runtime(config, provider, registry, tmp_path).run()
+        assert run.status == STATUS_COMPLETED
+        assert (tmp_path / "add.py").read_text(encoding="utf-8").startswith("def add")
+
+    def test_adaptive_plus_managed_end_to_end_completes(self, registry, tmp_path):
+        provider = ScriptedProvider(
+            [
+                _tool(
+                    "write_file",
+                    {"path": "add.py", "content": "def add(a, b):\n    return a + b\n"},
+                ),
+                _text("Created add.py."),
+            ]
+        )
+        config = AgentConfig(
+            task="Create a new file named add.py with an add(a, b) function.",
+            tool_exposure=AdaptiveToolExposure(),
+            context_strategy=ManagedContextStrategy(),
+        )
+        run = _runtime(config, provider, registry, tmp_path).run()
+        assert run.status == STATUS_COMPLETED
+        assert (tmp_path / "add.py").read_text(encoding="utf-8").startswith("def add")
 
     def test_trace_records_adaptive_strategy_and_subset(self, registry, tmp_path):
         provider = ScriptedProvider([_text("done")])

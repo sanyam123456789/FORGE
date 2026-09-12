@@ -4,7 +4,8 @@ forge.evaluation.runner — the evaluation runner.
 ``EvaluationRunner`` is a thin measurement wrapper *around* the existing
 ``forge.agent.AgentRuntime``.  It:
 
-1. resolves the (currently only) ``fixed`` / ``raw`` strategy pair,
+1. resolves the requested tool/context strategy pair (fixed|adaptive x
+   raw|managed, as of Step 6),
 2. gives the run an isolated workspace (a temp dir unless one is provided),
 3. invokes the one real FORGE agent loop,
 4. runs the task's artefact checks against the resulting workspace,
@@ -170,6 +171,9 @@ class EvaluationRunner:
             cached_input_tokens=agent_run.cached_input_tokens,
             context_messages=agent_run.context_messages,
             context_char_count=agent_run.context_char_count,
+            context_items_dropped=agent_run.context_items_dropped,
+            context_items_compressed=agent_run.context_items_compressed,
+            context_chars_saved=agent_run.context_chars_saved,
             cost_available=cost_usd is not None,
             cost_usd=cost_usd,
             cost_source=pricing.source if pricing is not None else None,
