@@ -6,13 +6,16 @@ constant during the research comparison, plus the two that will vary:
 
     held constant : provider, model, temperature, max_output_tokens,
                     max_llm_turns, max_tool_calls, the task
-    varied later  : tool_strategy  (fixed  -> adaptive)
-                    context_strategy (raw  -> managed)
+    varied        : tool_strategy  (fixed  |  adaptive)
+    varied later  : context_strategy (raw  -> managed)
 
-Only ``fixed`` / ``raw`` are implemented in this step.  ``adaptive`` and
-``managed`` are recognised names (so a future result file is unambiguous)
-but ``resolve_strategies()`` raises ``NotImplementedError`` for them — this
-package measures; it does not add agent behaviour.
+As of Step 5, both ``fixed`` and ``adaptive`` tool strategies are
+implemented and may be freely combined with the ``raw`` context strategy.
+``managed`` context remains a recognised name only (so a future result file
+is unambiguous) — ``resolve_strategies()`` still raises
+``NotImplementedError`` for it. This package measures; it does not add
+agent behaviour beyond selecting the strategy objects the real
+``AgentRuntime`` already knows how to use.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from forge.context import ContextStrategy, RawContextStrategy
-from forge.tools import FixedToolExposure, ToolExposureStrategy
+from forge.tools import AdaptiveToolExposure, FixedToolExposure, ToolExposureStrategy
 
 # --- Strategy identifiers -------------------------------------------------
 
@@ -32,11 +35,13 @@ CONTEXT_STRATEGY_RAW = "raw"
 CONTEXT_STRATEGY_MANAGED = "managed"
 
 #: Strategies this step can actually execute.
-IMPLEMENTED_TOOL_STRATEGIES: frozenset[str] = frozenset({TOOL_STRATEGY_FIXED})
+IMPLEMENTED_TOOL_STRATEGIES: frozenset[str] = frozenset(
+    {TOOL_STRATEGY_FIXED, TOOL_STRATEGY_ADAPTIVE}
+)
 IMPLEMENTED_CONTEXT_STRATEGIES: frozenset[str] = frozenset({CONTEXT_STRATEGY_RAW})
 
 #: Strategies that are planned but NOT implemented — allowed as labels only.
-FUTURE_TOOL_STRATEGIES: frozenset[str] = frozenset({TOOL_STRATEGY_ADAPTIVE})
+FUTURE_TOOL_STRATEGIES: frozenset[str] = frozenset()
 FUTURE_CONTEXT_STRATEGIES: frozenset[str] = frozenset({CONTEXT_STRATEGY_MANAGED})
 
 _KNOWN_TOOL_STRATEGIES = IMPLEMENTED_TOOL_STRATEGIES | FUTURE_TOOL_STRATEGIES
@@ -132,7 +137,12 @@ class ExperimentConfig:
                 f"this step. Implemented: {sorted(IMPLEMENTED_CONTEXT_STRATEGIES)}. "
                 f"Planned: {sorted(FUTURE_CONTEXT_STRATEGIES)}."
             )
-        return FixedToolExposure(), RawContextStrategy()
+        tool_exposure: ToolExposureStrategy = (
+            AdaptiveToolExposure()
+            if self.tool_strategy == TOOL_STRATEGY_ADAPTIVE
+            else FixedToolExposure()
+        )
+        return tool_exposure, RawContextStrategy()
 
     # -- serialisation ---------------------------------------------------
 

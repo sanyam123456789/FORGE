@@ -172,18 +172,57 @@ def test_evaluate_writes_result_row(tmp_path, monkeypatch, capsys):
 
 
 def test_evaluate_unimplemented_strategy_exits_2(tmp_path, monkeypatch):
+    # Managed Context is the strategy still not implemented as of Step 5.
     _patch_provider(monkeypatch, _Scripted([LLMResponse(content="x", stop_reason="stop")]))
     code = cli.main(
         [
             "evaluate",
             "--task", "t",
-            "--tool-strategy", "adaptive",
+            "--context-strategy", "managed",
             "--workspace", str(tmp_path / "ws"),
             "--results-file", str(tmp_path / "eval.jsonl"),
             "--no-trace",
         ]
     )
     assert code == 2
+
+
+def test_evaluate_adaptive_tool_strategy_runs(tmp_path, monkeypatch, capsys):
+    provider = _Scripted(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="write_file",
+                        arguments={"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"},
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            LLMResponse(content="done", stop_reason="stop"),
+        ]
+    )
+    _patch_provider(monkeypatch, provider)
+    results_file = tmp_path / "eval.jsonl"
+
+    code = cli.main(
+        [
+            "evaluate",
+            "--task", "Create a new file named calc.py with add(a, b).",
+            "--task-id", "calc",
+            "--tool-strategy", "adaptive",
+            "--workspace", str(tmp_path / "ws"),
+            "--results-file", str(results_file),
+            "--no-trace",
+            "--json",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tool_strategy"] == "adaptive"
+    assert payload["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------

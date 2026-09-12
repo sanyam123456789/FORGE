@@ -24,10 +24,10 @@ The Step 4 baseline task suite (``experiments/tasks/*.json``) is loaded by
 ``forge.evaluation.suite`` into the same ``EvalTask`` type — no parallel
 abstraction.
 
-Only the ``fixed`` tool strategy and the ``raw`` context strategy are
-implemented.  ``adaptive`` tools and ``managed`` context are named here so
-future results can be compared unambiguously, but requesting them raises
-``NotImplementedError`` — these steps build the ruler, not the interventions.
+Both the ``fixed`` and ``adaptive`` tool strategies are implemented (Step 5)
+and may run under the ``raw`` context strategy. ``managed`` context is named
+here so a future result file can be compared unambiguously, but requesting it
+raises ``NotImplementedError`` — Managed Context is not implemented yet.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from forge.evaluation.experiment import (
     FUTURE_TOOL_STRATEGIES,
     IMPLEMENTED_CONTEXT_STRATEGIES,
     IMPLEMENTED_TOOL_STRATEGIES,
+    TOOL_STRATEGY_ADAPTIVE,
     TOOL_STRATEGY_FIXED,
     ExperimentConfig,
 )
@@ -87,6 +88,7 @@ __all__ = [
     # experiment configuration
     "ExperimentConfig",
     "TOOL_STRATEGY_FIXED",
+    "TOOL_STRATEGY_ADAPTIVE",
     "CONTEXT_STRATEGY_RAW",
     "IMPLEMENTED_TOOL_STRATEGIES",
     "IMPLEMENTED_CONTEXT_STRATEGIES",

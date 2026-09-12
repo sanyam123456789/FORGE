@@ -30,8 +30,8 @@ evaluate options:
     --task TEXT / --task-file PATH / --suite-task-id ID   (choose one)
     --task-id ID             override the stable task identity
     --suite-dir PATH         suite dir for --suite-task-id
-    --tool-strategy NAME     fixed (only implemented value)
-    --context-strategy NAME  raw   (only implemented value)
+    --tool-strategy NAME     fixed | adaptive (both implemented)
+    --context-strategy NAME  raw   (only implemented value; managed is not yet implemented)
     --workspace PATH         reuse a workspace (default: temp dir, cleaned)
     --results-file PATH      JSONL to append the result to
     --model / --max-turns / --max-tool-calls / --temperature / --no-trace / --json
@@ -90,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--task-id", default=None, help="override the stable task id (default: keep as defined)")
     ev.add_argument(
         "--tool-strategy", default="fixed",
-        help="tool exposure strategy (implemented: fixed)",
+        help="tool exposure strategy (implemented: fixed, adaptive)",
     )
     ev.add_argument(
         "--context-strategy", default="raw",

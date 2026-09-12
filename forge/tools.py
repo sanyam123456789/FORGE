@@ -24,6 +24,13 @@ Step 1 Status
 - Infrastructure is defined.
 - NO concrete tools are implemented yet.
 - Concrete tools (read_file, write_file, shell) will be added in Step 2.
+
+Step 5 Status
+-------------
+- ``AdaptiveToolExposure`` is implemented below: a deterministic,
+  keyword-based classifier that narrows the exposed tool set to what a task
+  plausibly needs, with a safe "expose everything" fallback. See its
+  docstring and ``docs/step-05-adaptive-tool-exposure.md``.
 """
 
 from __future__ import annotations
@@ -253,6 +260,141 @@ class FixedToolExposure(ToolExposureStrategy):
         task: str | None = None,
     ) -> list[str] | None:
         return list(self.pinned) if self.pinned is not None else None
+
+
+class AdaptiveToolExposure(ToolExposureStrategy):
+    """Expose only the tools relevant to the current task (Step 5 intervention).
+
+    Deliberately simple and fully deterministic — no ranking, no learned
+    model, no per-turn variation:
+
+    1. The task's natural-language prompt is classified into one of a small
+       fixed set of *categories* by case-insensitive substring matching
+       (``RULES``, checked in order; the first rule with a matching keyword
+       wins).
+    2. Each category maps to a fixed tuple of tool names (``CATEGORY_TOOLS``)
+       — the tools that kind of task plausibly needs.
+    3. The category's tools are intersected with what ``registry`` actually
+       has, so a registry that does not carry every built-in tool never
+       raises ``KeyError`` from ``ToolRegistry.get_schemas``.
+    4. If no rule matches the task text, or nothing survives the
+       registry intersection, ``select()`` returns ``None`` — the same
+       "expose everything" behaviour as ``FixedToolExposure`` — rather than
+       guessing. Adaptive exposure can therefore only ever *narrow* what a
+       recognised task sees; an unrecognised task is never starved of a tool
+       it might need.
+
+    Classification looks only at the initial task text, never at ``context``:
+    the same task string always yields the same tool subset, on every turn of
+    a run and across separate runs. This is intentionally a placeholder for a
+    more advanced policy (embedding similarity, per-turn re-ranking, a
+    learned selector, ...) — everything downstream (the agent loop, the
+    tracer, ``EvalResult``) depends only on the ``ToolExposureStrategy``
+    interface, so a future replacement is a drop-in that changes nothing
+    else.
+
+    Limitations (Step 5)
+    ---------------------
+    - Keyword matching on the raw prompt is coarse: a task phrased
+      unusually may fall into the "no category matched" fallback (safe, but
+      not narrowed) or, in principle, an unintended category.
+    - The policy is static and does not learn from the run's actual tool
+      usage or from prior runs.
+    - Only the five built-in tools are categorised; a newly added tool with
+      no entry in ``CATEGORY_TOOLS`` is simply never offered by a matched
+      category (it is still offered whenever the safe fallback applies).
+    """
+
+    name = "adaptive"
+
+    #: category -> tool names relevant to that category. Tuples for
+    #: immutability; order does not affect exposure (schemas are looked up by
+    #: name), only readability.
+    CATEGORY_TOOLS: dict[str, tuple[str, ...]] = {
+        # A brand-new file: nothing to inspect or run yet, but read_file lets
+        # the agent check the workspace state first if it chooses to.
+        "create": ("read_file", "write_file", "list_directory"),
+        # An existing file needs to be read and changed in place.
+        "edit": ("read_file", "edit_file", "list_directory"),
+        # The task explicitly involves running code (tests, scripts) and may
+        # also need to create/modify files along the way.
+        "test": (
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_directory",
+            "run_shell",
+        ),
+    }
+
+    #: Ordered (category, keywords) rules. Matching is a case-insensitive
+    #: substring search over the raw task prompt; the first rule with a
+    #: matching keyword wins. "test" is checked first: a task that both
+    #: creates and *runs* a test file needs the full "test" toolset, not
+    #: just "create".
+    RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "test",
+            (
+                "pytest",
+                "run_shell",
+                "unit test",
+                "unit-test",
+                "test_",
+                "run the tests",
+                "run 'python",
+                "confirm the tests",
+                "tests pass",
+            ),
+        ),
+        (
+            "create",
+            (
+                "create a new file",
+                "create a file named",
+                "new file named",
+                "create the file",
+            ),
+        ),
+        (
+            "edit",
+            (
+                "fix ",
+                "rename",
+                "refactor",
+                "extract",
+                "edit ",
+                "modify",
+                "update ",
+                "change ",
+                "add a ",
+                "add an ",
+            ),
+        ),
+    )
+
+    def classify(self, task: str | None) -> str | None:
+        """Return the matched category name, or ``None`` if nothing matched."""
+        text = (task or "").lower()
+        if not text.strip():
+            return None
+        for category, keywords in self.RULES:
+            if any(keyword in text for keyword in keywords):
+                return category
+        return None
+
+    def select(
+        self,
+        registry: "ToolRegistry",
+        context: "ConversationContext | None" = None,
+        task: str | None = None,
+    ) -> list[str] | None:
+        category = self.classify(task)
+        if category is None:
+            return None  # unrecognised task: safe fallback = expose everything
+        candidates = self.CATEGORY_TOOLS[category]
+        selected = [name for name in candidates if name in registry]
+        return selected or None  # nothing survived -> same safe fallback
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from forge.tools import Tool, ToolRegistry, ToolResult
+from forge.tools import AdaptiveToolExposure, Tool, ToolRegistry, ToolResult
 
 
 # ---------------------------------------------------------------------------
@@ -157,3 +157,130 @@ class TestEchoTool:
     def test_to_schema(self):
         schema = EchoTool().to_schema()
         assert schema["function"]["name"] == "echo"
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveToolExposure (Step 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def builtin_registry(tmp_path):
+    from forge.builtin_tools import build_default_registry
+
+    return build_default_registry(workspace_root=tmp_path)
+
+
+class TestAdaptiveToolExposureClassification:
+    def test_name_is_adaptive(self):
+        assert AdaptiveToolExposure().name == "adaptive"
+
+    def test_create_task_classified_as_create(self):
+        strategy = AdaptiveToolExposure()
+        assert strategy.classify("Create a new file named foo.py with a hello().") == "create"
+
+    def test_bug_fix_task_classified_as_edit(self):
+        strategy = AdaptiveToolExposure()
+        assert strategy.classify("Fix the off-by-one bug in ranges.py.") == "edit"
+
+    def test_rename_and_refactor_tasks_classified_as_edit(self):
+        strategy = AdaptiveToolExposure()
+        assert strategy.classify("Rename the function tally to count_items.") == "edit"
+        assert strategy.classify("Extract the duplicated logic into a helper.") == "edit"
+
+    def test_testing_task_classified_as_test(self):
+        strategy = AdaptiveToolExposure()
+        text = "Write pytest tests and run 'python -m pytest -q' to confirm the tests pass."
+        assert strategy.classify(text) == "test"
+
+    def test_test_keywords_take_priority_over_create_keywords(self):
+        # A task that both creates a file and mentions pytest must get the
+        # full "test" toolset, not the narrower "create" one.
+        strategy = AdaptiveToolExposure()
+        text = "Create a new file named test_mathlib.py with pytest tests."
+        assert strategy.classify(text) == "test"
+
+    def test_unrecognised_task_returns_none(self):
+        strategy = AdaptiveToolExposure()
+        assert strategy.classify("Please help me understand the moon phases.") is None
+
+    def test_empty_or_missing_task_returns_none(self):
+        strategy = AdaptiveToolExposure()
+        assert strategy.classify("") is None
+        assert strategy.classify("   ") is None
+        assert strategy.classify(None) is None
+
+    def test_classification_is_case_insensitive(self):
+        strategy = AdaptiveToolExposure()
+        assert strategy.classify("FIX THE BUG IN ranges.py") == "edit"
+
+
+class TestAdaptiveToolExposureSelection:
+    def test_create_task_selects_creation_tools(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        selected = strategy.select(
+            builtin_registry, task="Create a new file named foo.py with a hello()."
+        )
+        assert set(selected) == {"read_file", "write_file", "list_directory"}
+        assert "edit_file" not in selected
+        assert "run_shell" not in selected
+
+    def test_edit_task_selects_editing_tools(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        selected = strategy.select(
+            builtin_registry, task="Fix the off-by-one bug in ranges.py."
+        )
+        assert set(selected) == {"read_file", "edit_file", "list_directory"}
+        assert "write_file" not in selected
+        assert "run_shell" not in selected
+
+    def test_testing_task_selects_full_toolset(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        text = "Write pytest tests and run 'python -m pytest -q' to confirm the tests pass."
+        selected = strategy.select(builtin_registry, task=text)
+        assert set(selected) == set(builtin_registry.list_names())
+
+    def test_unrecognised_task_falls_back_to_all_tools(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        selected = strategy.select(
+            builtin_registry, task="Please help me understand the moon phases."
+        )
+        assert selected is None  # same "expose everything" contract as Fixed
+
+    def test_none_task_falls_back_to_all_tools(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        assert strategy.select(builtin_registry, task=None) is None
+
+    def test_selection_is_deterministic(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        task = "Fix the off-by-one bug in ranges.py."
+        first = strategy.select(builtin_registry, task=task)
+        second = strategy.select(builtin_registry, task=task)
+        assert first == second
+
+    def test_candidates_are_filtered_against_a_partial_registry(self, tmp_path):
+        from forge.builtin_tools import ReadFileTool, WriteFileTool
+
+        partial = ToolRegistry()
+        partial.register(ReadFileTool(workspace_root=tmp_path))
+        partial.register(WriteFileTool(workspace_root=tmp_path))
+
+        strategy = AdaptiveToolExposure()
+        text = "Write pytest tests and run 'python -m pytest -q' to confirm the tests pass."
+        selected = strategy.select(partial, task=text)
+        # "test" category wants 5 tools; only 2 are registered -> no crash,
+        # and only the registered ones come back.
+        assert selected == ["read_file", "write_file"]
+
+    def test_fallback_when_nothing_survives_registry_filtering(self):
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        strategy = AdaptiveToolExposure()
+        selected = strategy.select(registry, task="Fix the off-by-one bug in ranges.py.")
+        assert selected is None  # none of the "edit" candidates are registered
+
+    def test_ambiguous_task_does_not_crash(self, builtin_registry):
+        strategy = AdaptiveToolExposure()
+        for weird in ("", "   ", "???", "🚀" * 5, "a" * 5000):
+            selected = strategy.select(builtin_registry, task=weird)
+            assert selected is None or isinstance(selected, list)

@@ -22,7 +22,7 @@ from forge.agent import (
 )
 from forge.builtin_tools import build_default_registry
 from forge.llm import LLMError, LLMProvider, LLMResponse, ToolCall
-from forge.tools import FixedToolExposure
+from forge.tools import AdaptiveToolExposure, FixedToolExposure
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +379,91 @@ class TestFixedToolExposure:
         src = inspect.getsource(agent)
         assert "tool_exposure.select(" in src
         assert "adaptive" not in src.lower()
+
+
+# ---------------------------------------------------------------------------
+# Adaptive tool exposure (Step 5) — the loop is unmodified; only the strategy
+# object passed in via AgentConfig.tool_exposure changes.
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptiveToolExposureEndToEnd:
+    def test_create_task_completes_with_narrowed_tool_exposure(self, registry, tmp_path):
+        provider = ScriptedProvider(
+            [
+                _tool(
+                    "write_file",
+                    {"path": "add.py", "content": "def add(a, b):\n    return a + b\n"},
+                ),
+                _text("Created add.py."),
+            ]
+        )
+        config = AgentConfig(
+            task="Create a new file named add.py with an add(a, b) function.",
+            tool_exposure=AdaptiveToolExposure(),
+        )
+        run = _runtime(config, provider, registry, tmp_path).run()
+
+        assert run.status == STATUS_COMPLETED
+        assert (tmp_path / "add.py").read_text(encoding="utf-8").startswith("def add")
+
+        # Every turn saw the same narrowed subset — edit_file / run_shell were
+        # never offered because the task did not need them.
+        for call in provider.calls:
+            names = {t["function"]["name"] for t in call["tools"]}
+            assert names == {"read_file", "write_file", "list_directory"}
+
+    def test_edit_task_excludes_write_file_and_run_shell(self, registry, tmp_path):
+        (tmp_path / "ranges.py").write_text(
+            "def inclusive_sum(n):\n    return sum(range(n))\n", encoding="utf-8"
+        )
+        provider = ScriptedProvider(
+            [
+                _tool(
+                    "edit_file",
+                    {
+                        "path": "ranges.py",
+                        "old_string": "sum(range(n))",
+                        "new_string": "sum(range(n + 1))",
+                    },
+                ),
+                _text("Fixed the off-by-one bug."),
+            ]
+        )
+        config = AgentConfig(
+            task="Fix the off-by-one bug in ranges.py.",
+            tool_exposure=AdaptiveToolExposure(),
+        )
+        run = _runtime(config, provider, registry, tmp_path).run()
+
+        assert run.status == STATUS_COMPLETED
+        names = {t["function"]["name"] for t in provider.calls[0]["tools"]}
+        assert names == {"read_file", "edit_file", "list_directory"}
+        assert "write_file" not in names
+        assert "run_shell" not in names
+
+    def test_unrecognised_task_falls_back_to_every_tool(self, registry, tmp_path):
+        provider = ScriptedProvider([_text("no tools needed")])
+        config = AgentConfig(
+            task="Please help me understand the moon phases.",
+            tool_exposure=AdaptiveToolExposure(),
+        )
+        run = _runtime(config, provider, registry, tmp_path).run()
+
+        assert run.status == STATUS_COMPLETED
+        names = {t["function"]["name"] for t in provider.calls[0]["tools"]}
+        assert names == set(registry.list_names())
+
+    def test_trace_records_adaptive_strategy_and_subset(self, registry, tmp_path):
+        provider = ScriptedProvider([_text("done")])
+        config = AgentConfig(
+            task="Create a new file named add.py with an add(a, b) function.",
+            tool_exposure=AdaptiveToolExposure(),
+        )
+        run = _runtime(config, provider, registry, tmp_path).run()
+
+        start = json.loads(run.trace_path.read_text(encoding="utf-8").splitlines()[0])
+        assert start["data"]["tool_exposure_strategy"] == "adaptive"
+        assert set(start["data"]["tool_subset"]) == {
+            "read_file", "write_file", "list_directory",
+        }

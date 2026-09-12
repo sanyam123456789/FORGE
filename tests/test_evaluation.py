@@ -196,14 +196,20 @@ class TestExperimentConfig:
         with pytest.raises(ValueError):
             _experiment(context_strategy="banana")
 
-    def test_future_strategies_are_named_but_not_runnable(self):
+    def test_adaptive_tool_strategy_is_implemented(self):
+        # Step 5: adaptive tool exposure is now a real, runnable strategy.
         adaptive = _experiment(tool_strategy="adaptive")
-        managed = _experiment(context_strategy="managed")
-        assert adaptive.is_implemented is False
-        assert managed.is_implemented is False
+        assert adaptive.is_implemented is True
         assert adaptive.strategy_key == "adaptive+raw"
-        with pytest.raises(NotImplementedError):
-            adaptive.resolve_strategies()
+        tool_strat, ctx_strat = adaptive.resolve_strategies()
+        assert tool_strat.name == "adaptive"
+        assert ctx_strat.name == "raw"
+
+    def test_managed_context_strategy_is_not_runnable(self):
+        # Managed Context is out of scope for Step 5 and remains unimplemented.
+        managed = _experiment(context_strategy="managed")
+        assert managed.is_implemented is False
+        assert managed.strategy_key == "fixed+managed"
         with pytest.raises(NotImplementedError):
             managed.resolve_strategies()
 
@@ -304,10 +310,51 @@ class TestEvaluationRunner:
         assert not Path(result.workspace).exists()  # auto-removed
 
     def test_unimplemented_strategy_raises_not_implemented(self, tmp_path):
+        # Managed Context remains unimplemented in Step 5.
         provider = _write_calc_then_done()
         runner = EvaluationRunner(settings=_SETTINGS, provider=provider, write_trace=False)
         with pytest.raises(NotImplementedError):
-            runner.run(_calc_task(), _experiment(tool_strategy="adaptive"))
+            runner.run(_calc_task(), _experiment(context_strategy="managed"))
+
+    def test_run_with_adaptive_tool_strategy_narrows_exposed_tools(self, tmp_path):
+        # A prompt that matches the "create" keyword rule (see
+        # AdaptiveToolExposure.RULES) should narrow exposure away from
+        # edit_file / run_shell while still letting the real agent loop
+        # complete the task end-to-end.
+        task = EvalTask(
+            task_id="calc-create",
+            prompt=(
+                "Create a new file named calculator.py with add(a, b) and "
+                "multiply(a, b)."
+            ),
+            checks=(
+                ArtifactCheck(
+                    path="calculator.py",
+                    must_contain=("def add(a, b)", "def multiply(a, b)"),
+                ),
+            ),
+        )
+        provider = _write_calc_then_done()
+        runner = EvaluationRunner(
+            settings=_SETTINGS, provider=provider, trace_dir=tmp_path / "traces"
+        )
+        result = runner.run(
+            task,
+            _experiment(task_id=task.task_id, tool_strategy="adaptive"),
+            workspace=tmp_path / "ws",
+        )
+
+        assert result.tool_strategy == "adaptive"
+        assert result.status == "completed"
+        assert result.success is True
+
+        events = [
+            json.loads(line)
+            for line in open(result.trace_path, encoding="utf-8").read().splitlines()
+        ]
+        start = events[0]["data"]
+        assert start["tool_exposure_strategy"] == "adaptive"
+        assert set(start["tool_subset"]) == {"read_file", "write_file", "list_directory"}
 
     # -- D + G + J. None-safe metrics / failed runs ---------------------
 

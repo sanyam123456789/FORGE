@@ -99,13 +99,13 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.safety` | Enforce workspace boundaries and command restrictions before any file/shell operation. |
 | `forge.llm` | Provider-agnostic vocabulary (`Message`, `ToolCall`, `LLMResponse`, `LLMError`), the `LLMProvider` ABC, and `get_provider()`. |
 | `forge.providers` | Concrete adapters. `forge.providers.gemini` is the only one so far; nothing else imports a provider SDK. |
-| `forge.tools` | `Tool` ABC, `ToolRegistry` (`get_schemas(subset)` = exposure hook), and the `ToolExposureStrategy` seam (`FixedToolExposure`). |
+| `forge.tools` | `Tool` ABC, `ToolRegistry` (`get_schemas(subset)` = exposure hook), and the `ToolExposureStrategy` seam (`FixedToolExposure`, `AdaptiveToolExposure` — Step 5). |
 | `forge.builtin_tools` | The five concrete tools + `build_default_registry()`. |
 | `forge.context` | `ConversationContext` history container + the `ContextStrategy` seam (`RawContextStrategy`). |
 | `forge.prompts` | Canonical `FORGE_SYSTEM_PROMPT` and its stable `sha256` identifier. |
 | `forge.agent` | The agent loop. Owns the run lifecycle, hard limits, tool dispatch, and error handling. |
 | `forge.observability` | Record typed events per run. Flush to JSONL. Never fabricate measurements (`None` ≠ `0`). |
-| `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. Only `fixed`+`raw` runs; `adaptive`/`managed` raise `NotImplementedError`. See `docs/step-03-evaluation.md`. |
+| `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. `fixed`/`adaptive` tool strategies both run under `raw` context (Step 5); `managed` context still raises `NotImplementedError`. See `docs/step-03-evaluation.md`, `docs/step-05-adaptive-tool-exposure.md`. |
 | `forge.evaluation.suite` | Step 4 loader for the version-controlled baseline task suite in `experiments/tasks/` (→ ordinary `EvalTask`s, with fixtures provisioned into the run workspace). See `docs/step-04-baseline-tasks.md`. |
 | `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`. |
 
@@ -120,12 +120,14 @@ The diagram below shows the same flow with the research seams marked.
 | Condition | Description | Status |
 |---|---|---|
 | Fixed | All registered tools always exposed (baseline) | **implemented** (`FixedToolExposure`) |
-| Adaptive | Only tools relevant to the current task phase exposed | later |
+| Adaptive | Only tools relevant to the current task exposed, via deterministic keyword classification | **implemented** (`AdaptiveToolExposure`, Step 5) |
 
 **Seam:** `ToolExposureStrategy.select(registry, context, task) -> list[str] | None`
 in `forge/tools.py`, consumed by `AgentRuntime` and fed to
 `ToolRegistry.get_schemas(subset)`. The agent never branches on an "adaptive"
-flag — it only calls `select()`.
+flag — it only calls `select()`. See `docs/step-05-adaptive-tool-exposure.md`
+for the classification policy, its category → tool mapping, and its
+limitations.
 
 ### Arm B — Context Management Strategy
 
@@ -213,3 +215,4 @@ against disposable workspaces.
 | Gemini as the first provider (Step 2) | Current, non-permanent choice. Confined to `forge/providers/gemini.py`; `google-genai` is lazy-imported. The rest of FORGE only sees `forge.llm` types. |
 | Strategy *objects* for the research arms | `ToolExposureStrategy` / `ContextStrategy` are injected into `AgentRuntime`. Swapping Fixed→Adaptive or Raw→Managed later needs no change to the loop, and the strategy id is recorded in every trace. |
 | `None` ≠ `0` for usage | A metric a provider does not report is recorded as `None`; input and output availability are tracked independently so a real zero is never invented. |
+| Keyword-based classifier for `AdaptiveToolExposure` (Step 5) | Deterministic, explainable, and dependency-free — no embeddings/ML model needed to compare Fixed vs. Adaptive. Deliberately a placeholder: a learned or per-turn selector can replace it later without touching `AgentRuntime`, `ExperimentConfig`, or the tracer. |
