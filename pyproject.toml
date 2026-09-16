@@ -14,13 +14,21 @@ license = { text = "MIT" }
 # Runtime dependencies — kept minimal by design.
 # Each dependency must be justified before adding.
 #
-# python-dotenv:  loads .env file into environment at startup.
-#                 Zero-config developer convenience; imported lazily.
-# google-genai:   official Google Gemini SDK. Gemini is the current
-#                 (not permanent) LLM provider. Confined to
-#                 forge/providers/gemini.py behind the LLMProvider
-#                 interface; imported lazily so tests and non-LLM code
-#                 paths do not require it.
+# python-dotenv:      loads .env file into environment at startup.
+#                     Zero-config developer convenience; imported lazily.
+# google-genai:       official Google Gemini SDK. Confined to
+#                     forge/providers/gemini.py behind the LLMProvider
+#                     interface; imported lazily so tests and non-LLM code
+#                     paths do not require it.
+# groq:               official Groq SDK (first fallback provider). Confined
+#                     to forge/providers/groq.py; imported lazily.
+# cerebras_cloud_sdk: official Cerebras SDK (second fallback provider).
+#                     Confined to forge/providers/cerebras.py; imported
+#                     lazily.
+#
+# Gemini/Groq/Cerebras are the current (not permanent) LLM providers; the
+# FallbackProvider that orders them (forge/providers/fallback.py) is opt-in
+# and adds no dependency of its own.
 #
 # Still deliberately absent: agent frameworks, vector stores, databases,
 # web frameworks, tokenizer libraries.
@@ -28,6 +36,8 @@ license = { text = "MIT" }
 dependencies = [
     "python-dotenv>=1.0",
     "google-genai>=1.0",
+    "groq>=1.0",
+    "cerebras_cloud_sdk>=1.0",
 ]
 
 [project.optional-dependencies]

@@ -104,21 +104,26 @@ def _response(parts, *, finish="STOP", usage=None, model_version="gemini-3.6-fla
 
 
 class FakeModels:
-    def __init__(self, response=None, raises=None):
+    def __init__(self, response=None, raises=None, raises_sequence=None):
         self._response = response
         self._raises = raises
+        self._raises_sequence = list(raises_sequence) if raises_sequence else None
         self.calls = []
 
     def generate_content(self, *, model, contents, config):
         self.calls.append({"model": model, "contents": contents, "config": config})
+        if self._raises_sequence:
+            raise self._raises_sequence.pop(0)
         if self._raises is not None:
             raise self._raises
         return self._response
 
 
 class FakeClient:
-    def __init__(self, response=None, raises=None):
-        self.models = FakeModels(response=response, raises=raises)
+    def __init__(self, response=None, raises=None, raises_sequence=None):
+        self.models = FakeModels(
+            response=response, raises=raises, raises_sequence=raises_sequence
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +427,168 @@ class TestErrorHandling:
         provider = GeminiProvider(api_key="x", client=client)
         with pytest.raises(LLMError, match="Gemini API error"):
             provider.complete([Message(role="user", content="hi")])
+
+    @staticmethod
+    def _rate_limit_error(retry_delay="1.5s"):
+        from google.genai import errors as genai_errors
+
+        details = []
+        if retry_delay is not None:
+            details.append(
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": retry_delay,
+                }
+            )
+        return genai_errors.APIError(
+            429,
+            {
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": "quota exceeded",
+                    "details": details,
+                }
+            },
+        )
+
+    def test_rate_limit_retries_then_succeeds(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(
+            "forge.providers.gemini.time.sleep", lambda s: sleeps.append(s)
+        )
+        client = FakeClient(
+            raises_sequence=[self._rate_limit_error(retry_delay="1.5s")],
+            response=_response([_text_part("ok")]),
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+
+        resp = provider.complete([Message(role="user", content="hi")])
+
+        assert resp.content == "ok"
+        assert len(client.models.calls) == 2
+        assert sleeps == [1.5]
+
+    def test_rate_limit_exhausts_retries_then_raises(self, monkeypatch):
+        monkeypatch.setattr("forge.providers.gemini.time.sleep", lambda s: None)
+        client = FakeClient(
+            raises_sequence=[self._rate_limit_error() for _ in range(5)]
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+
+        with pytest.raises(LLMError, match="Gemini API error"):
+            provider.complete([Message(role="user", content="hi")])
+
+        # 1 initial attempt + 3 bounded retries = 4 calls, then raise.
+        assert len(client.models.calls) == 4
+
+    def test_rate_limit_without_retry_delay_uses_default_backoff(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(
+            "forge.providers.gemini.time.sleep", lambda s: sleeps.append(s)
+        )
+        client = FakeClient(
+            raises_sequence=[self._rate_limit_error(retry_delay=None)],
+            response=_response([_text_part("ok")]),
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+
+        resp = provider.complete([Message(role="user", content="hi")])
+
+        assert resp.content == "ok"
+        assert sleeps == [5.0]  # default backoff, attempt 0
+
+    def test_non_rate_limit_api_error_does_not_retry(self, monkeypatch):
+        from google.genai import errors as genai_errors
+
+        sleeps = []
+        monkeypatch.setattr(
+            "forge.providers.gemini.time.sleep", lambda s: sleeps.append(s)
+        )
+        err = genai_errors.APIError(
+            500, {"error": {"code": 500, "status": "INTERNAL", "message": "oops"}}
+        )
+        client = FakeClient(raises=err)
+        provider = GeminiProvider(api_key="x", client=client)
+
+        with pytest.raises(LLMError, match="Gemini API error"):
+            provider.complete([Message(role="user", content="hi")])
+
+        assert len(client.models.calls) == 1
+        assert sleeps == []
+
+    @staticmethod
+    def _quota_error(*, per_day: bool, retry_delay="0s"):
+        """Shaped exactly like the real Gemini 429 payloads observed in
+        production sessions: a QuotaFailure detail naming the exhausted
+        quota bucket, alongside a RetryInfo detail (the API returns a short
+        retryDelay even for the daily bucket, which is precisely why it
+        cannot be trusted to distinguish the two cases — quotaId must be
+        inspected instead)."""
+        from google.genai import errors as genai_errors
+
+        quota_id = (
+            "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+            if per_day
+            else "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+        )
+        return genai_errors.APIError(
+            429,
+            {
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": "quota exceeded",
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                            "violations": [{"quotaId": quota_id, "quotaValue": "20"}],
+                        },
+                        {
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": retry_delay,
+                        },
+                    ],
+                }
+            },
+        )
+
+    def test_daily_quota_exhausted_fails_fast_with_zero_sleeps(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr(
+            "forge.providers.gemini.time.sleep", lambda s: sleeps.append(s)
+        )
+        client = FakeClient(raises=self._quota_error(per_day=True))
+        provider = GeminiProvider(api_key="x", client=client)
+
+        with pytest.raises(LLMError, match="Gemini API error") as exc_info:
+            provider.complete([Message(role="user", content="hi")])
+
+        # Exactly one HTTP attempt, zero backoff sleeps — the whole point
+        # of the fix (previously this path cost ~130s of retries).
+        assert len(client.models.calls) == 1
+        assert sleeps == []
+        assert exc_info.value.retryable is True  # still fallback-eligible
+
+    def test_per_minute_quota_still_retries_normally(self, monkeypatch):
+        """The fast-fail path must be specific to the daily bucket — a
+        genuine per-minute rate limit keeps its existing retry-then-succeed
+        behavior unchanged."""
+        sleeps = []
+        monkeypatch.setattr(
+            "forge.providers.gemini.time.sleep", lambda s: sleeps.append(s)
+        )
+        client = FakeClient(
+            raises_sequence=[self._quota_error(per_day=False, retry_delay="2s")],
+            response=_response([_text_part("ok")]),
+        )
+        provider = GeminiProvider(api_key="x", client=client)
+
+        resp = provider.complete([Message(role="user", content="hi")])
+
+        assert resp.content == "ok"
+        assert len(client.models.calls) == 2
+        assert sleeps == [2.0]  # normal retry-with-backoff path, unaffected
 
 
 # ---------------------------------------------------------------------------

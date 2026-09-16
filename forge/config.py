@@ -33,7 +33,9 @@ except ImportError:
 # Type aliases
 # ---------------------------------------------------------------------------
 
-LLMProvider = Literal["gemini", "openai", "anthropic", "google", "openai_compatible"]
+LLMProvider = Literal[
+    "gemini", "groq", "cerebras", "openai", "anthropic", "google", "openai_compatible"
+]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 LogFormat = Literal["text", "json"]
 
@@ -57,6 +59,23 @@ class ForgeSettings:
     llm_api_key: str = field(default="")
     llm_base_url: str = field(default="")
 
+    # --- Multi-provider fallback (opt-in) ---
+    # Empty tuple (FORGE_PROVIDER_ORDER unset) preserves the exact single-
+    # provider behavior of every prior FORGE step: get_provider() returns
+    # one adapter for llm_provider, no fallback. Set FORGE_PROVIDER_ORDER
+    # (e.g. "gemini,groq,cerebras") to opt into FallbackProvider.
+    provider_order: tuple[str, ...] = field(default_factory=tuple)
+    groq_api_key: str = field(default="")
+    groq_model: str = field(default="")
+    cerebras_api_key: str = field(default="")
+    cerebras_model: str = field(default="")
+    # Shared bounded retry count for each adapter's own internal transient-
+    # error backoff (Groq, Cerebras). Gemini's existing internal 429 retry
+    # keeps its own separate constant, unchanged, per Step 9.
+    provider_retry_max: int = field(default=3)
+    # None = let the provider SDK use its own default timeout.
+    llm_request_timeout_s: float | None = field(default=None)
+
     # --- LLM generation ---
     llm_temperature: float = field(default=0.0)
     llm_max_output_tokens: int = field(default=4096)
@@ -74,11 +93,20 @@ class ForgeSettings:
     def __repr__(self) -> str:  # pragma: no cover
         """Redact secret fields from string representation."""
         key_hint = "***" if self.llm_api_key else "<not set>"
+        groq_key_hint = "***" if self.groq_api_key else "<not set>"
+        cerebras_key_hint = "***" if self.cerebras_api_key else "<not set>"
         return (
             f"ForgeSettings("
             f"llm_provider={self.llm_provider!r}, "
             f"llm_model={self.llm_model!r}, "
             f"llm_api_key={key_hint}, "
+            f"provider_order={self.provider_order!r}, "
+            f"groq_model={self.groq_model!r}, "
+            f"groq_api_key={groq_key_hint}, "
+            f"cerebras_model={self.cerebras_model!r}, "
+            f"cerebras_api_key={cerebras_key_hint}, "
+            f"provider_retry_max={self.provider_retry_max}, "
+            f"llm_request_timeout_s={self.llm_request_timeout_s}, "
             f"llm_temperature={self.llm_temperature}, "
             f"llm_max_output_tokens={self.llm_max_output_tokens}, "
             f"max_tool_calls={self.max_tool_calls}, "
@@ -151,6 +179,35 @@ def _get_path(key: str, default: Path) -> Path:
     return Path(raw) if raw else default
 
 
+def _get_list(key: str) -> tuple[str, ...]:
+    """Parse a comma-separated env var into a lowercase, whitespace-trimmed
+    tuple. Empty/unset returns an empty tuple (the opt-in default)."""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return ()
+    return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def _get_optional_float(
+    key: str, *, min_value: float | None = None
+) -> float | None:
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"FORGE configuration error: {key}={raw!r} is not a valid number."
+        ) from exc
+    if min_value is not None and value < min_value:
+        raise ValueError(
+            f"FORGE configuration error: {key}={value} is below the minimum "
+            f"allowed value ({min_value})."
+        )
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Public factory
 # ---------------------------------------------------------------------------
@@ -164,11 +221,23 @@ def load_settings() -> ForgeSettings:
     produce fresh instances with overridden environment variables.
     """
     provider_raw = _get_str("FORGE_LLM_PROVIDER", "gemini")
-    valid_providers = {"gemini", "openai", "anthropic", "google", "openai_compatible"}
+    valid_providers = {
+        "gemini", "groq", "cerebras", "openai", "anthropic", "google",
+        "openai_compatible",
+    }
     if provider_raw not in valid_providers:
         raise ValueError(
             f"FORGE_LLM_PROVIDER={provider_raw!r} is not supported. "
             f"Choose one of: {sorted(valid_providers)}"
+        )
+
+    provider_order = _get_list("FORGE_PROVIDER_ORDER")
+    implemented_providers = {"gemini", "groq", "cerebras"}
+    unknown = [p for p in provider_order if p not in implemented_providers]
+    if unknown:
+        raise ValueError(
+            f"FORGE_PROVIDER_ORDER contains unsupported provider(s) {unknown}. "
+            f"Implemented adapters: {sorted(implemented_providers)}"
         )
 
     log_level_raw = _get_str("FORGE_LOG_LEVEL", "INFO").upper()
@@ -192,6 +261,15 @@ def load_settings() -> ForgeSettings:
         llm_model=_get_str("FORGE_LLM_MODEL", "gemini-3.6-flash"),
         llm_api_key=_get_str("FORGE_LLM_API_KEY", ""),
         llm_base_url=_get_str("FORGE_LLM_BASE_URL", ""),
+        provider_order=provider_order,
+        groq_api_key=_get_str("FORGE_GROQ_API_KEY", ""),
+        groq_model=_get_str("FORGE_GROQ_MODEL", ""),
+        cerebras_api_key=_get_str("FORGE_CEREBRAS_API_KEY", ""),
+        cerebras_model=_get_str("FORGE_CEREBRAS_MODEL", ""),
+        provider_retry_max=_get_int("FORGE_PROVIDER_RETRY_MAX", 3, min_value=0),
+        llm_request_timeout_s=_get_optional_float(
+            "FORGE_LLM_REQUEST_TIMEOUT_S", min_value=0.0
+        ),
         llm_temperature=_get_float(
             "FORGE_LLM_TEMPERATURE", 0.0, min_value=0.0, max_value=2.0
         ),

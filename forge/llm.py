@@ -165,7 +165,23 @@ class LLMError(Exception):
     Adapters translate provider-native exceptions into this type so the
     agent runtime can handle provider failures without importing any
     provider SDK.
+
+    retryable:
+        ``True`` when the adapter has classified this failure as transient /
+        provider-availability related (rate limit, quota exhaustion,
+        temporary server error, connection failure) — i.e. a failure where
+        trying a *different* provider is a reasonable response.  ``False``
+        (the default) for anything that would fail identically on any
+        provider: authentication failure, malformed request, invalid tool
+        schema, programming error, invalid configuration. Only
+        ``forge.providers.fallback.FallbackProvider`` inspects this flag;
+        every other caller (``agent.py`` included) treats ``LLMError``
+        exactly as before this field was added.
     """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class LLMProvider(ABC):
@@ -240,29 +256,16 @@ class LLMProvider(ABC):
 # ---------------------------------------------------------------------------
 
 
-def get_provider(settings_override: Any = None) -> LLMProvider:
-    """Construct and return the configured LLM provider adapter.
+def _build_named_provider(name: str, settings: Any) -> LLMProvider:
+    """Construct one concrete adapter by provider name.
 
-    Reads ``settings.llm_provider`` / ``settings.llm_model`` (or the provided
-    *settings_override*) to select and configure the appropriate adapter.
-
-    Raises
-    ------
-    NotImplementedError
-        If the configured provider has no concrete adapter yet.
-    ImportError
-        If the required provider SDK is not installed.
-    ValueError
-        If the configuration is invalid (e.g. missing API key).
+    Construction never touches the network and never validates the API key
+    — that happens in the adapter's own ``preflight()`` (or on the first
+    real ``complete()`` call). This lets ``FallbackProvider`` build every
+    candidate in a fallback chain up front, even ones that are not yet
+    configured, and only find out they are unusable when actually reached.
     """
-    if settings_override is not None:
-        settings = settings_override
-    else:
-        from forge.config import settings  # local import avoids circular deps
-
-    provider = settings.llm_provider
-
-    if provider == "gemini":
+    if name == "gemini":
         from forge.providers.gemini import GeminiProvider
 
         return GeminiProvider(
@@ -270,9 +273,69 @@ def get_provider(settings_override: Any = None) -> LLMProvider:
             model=settings.llm_model,
         )
 
+    if name == "groq":
+        from forge.providers.groq import GroqProvider
+
+        return GroqProvider(
+            api_key=getattr(settings, "groq_api_key", "") or None,
+            model=getattr(settings, "groq_model", ""),
+            retry_max=getattr(settings, "provider_retry_max", 3),
+            timeout=getattr(settings, "llm_request_timeout_s", None),
+        )
+
+    if name == "cerebras":
+        from forge.providers.cerebras import CerebrasProvider
+
+        return CerebrasProvider(
+            api_key=getattr(settings, "cerebras_api_key", "") or None,
+            model=getattr(settings, "cerebras_model", ""),
+            retry_max=getattr(settings, "provider_retry_max", 3),
+            timeout=getattr(settings, "llm_request_timeout_s", None),
+        )
+
     raise NotImplementedError(
-        f"LLM provider adapter for '{provider}' is not implemented. "
-        "Step 2 ships the Gemini adapter only; set FORGE_LLM_PROVIDER=gemini. "
-        "Additional adapters (openai, anthropic, ...) can be added under "
-        "forge/providers/ behind the same LLMProvider interface."
+        f"LLM provider adapter for '{name}' is not implemented. "
+        "Implemented adapters: gemini, groq, cerebras. Additional adapters "
+        "(openai, anthropic, ...) can be added under forge/providers/ "
+        "behind the same LLMProvider interface."
     )
+
+
+def get_provider(settings_override: Any = None) -> LLMProvider:
+    """Construct and return the configured LLM provider adapter.
+
+    Reads ``settings.llm_provider`` / ``settings.llm_model`` (or the provided
+    *settings_override*) to select and configure the appropriate adapter.
+
+    If ``settings.provider_order`` is non-empty (``FORGE_PROVIDER_ORDER`` is
+    set), this instead returns a ``FallbackProvider`` that tries each named
+    provider in order, falling back only on clearly-recoverable errors. This
+    is opt-in: when ``FORGE_PROVIDER_ORDER`` is unset (the default), behavior
+    is identical to every prior FORGE step — a single adapter for
+    ``settings.llm_provider``, no fallback.
+
+    Raises
+    ------
+    NotImplementedError
+        If a configured provider name has no concrete adapter.
+    ImportError
+        If a required provider SDK is not installed.
+    ValueError
+        If the configuration is invalid (e.g. missing API key, empty
+        provider order).
+    """
+    if settings_override is not None:
+        settings = settings_override
+    else:
+        from forge.config import settings  # local import avoids circular deps
+
+    provider_order = getattr(settings, "provider_order", ())
+    if provider_order:
+        from forge.providers.fallback import FallbackProvider
+
+        candidates = [
+            (name, _build_named_provider(name, settings)) for name in provider_order
+        ]
+        return FallbackProvider(candidates)
+
+    return _build_named_provider(settings.llm_provider, settings)

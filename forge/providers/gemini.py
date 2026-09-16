@@ -18,12 +18,75 @@ An API key is never hard-coded and never logged.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from forge.llm import LLMError, LLMProvider, LLMResponse, Message, ToolCall
 from forge.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Bounded retry for transient rate-limit (429 RESOURCE_EXHAUSTED) responses
+# only. Any other APIError still raises immediately, unchanged.
+_RATE_LIMIT_MAX_RETRIES = 3
+_RATE_LIMIT_DEFAULT_BACKOFF_S = 5.0
+
+
+def _rate_limit_retry_delay_s(exc: Exception) -> float | None:
+    """Extract the API-suggested retry delay (seconds) from a 429 APIError, if present."""
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return None
+    error = details.get("error", {})
+    if not isinstance(error, dict):
+        return None
+    for item in error.get("details") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("@type", "")).endswith("RetryInfo"):
+            delay = item.get("retryDelay")
+            if isinstance(delay, str) and delay.endswith("s"):
+                try:
+                    return float(delay[:-1])
+                except ValueError:
+                    return None
+    return None
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    return getattr(exc, "code", None) == 429 or getattr(exc, "status", None) == (
+        "RESOURCE_EXHAUSTED"
+    )
+
+
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
+    """True when a 429's QuotaFailure detail names a *daily* quota.
+
+    Google's API reports two distinct free-tier quota buckets under the
+    same 429 RESOURCE_EXHAUSTED status: a per-minute one (worth retrying —
+    it clears within seconds) and a per-day one (``quotaId`` containing
+    "PerDay", e.g. ``GenerateRequestsPerDayPerProjectPerModel-FreeTier``),
+    which will not clear within any retry window attempted here. The API
+    still returns a short ``retryDelay`` for the daily case regardless,
+    which is why retrying it wastes real time for zero chance of success.
+    """
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict):
+        return False
+    error = details.get("error", {})
+    if not isinstance(error, dict):
+        return False
+    for item in error.get("details") or []:
+        if not isinstance(item, dict):
+            continue
+        if not str(item.get("@type", "")).endswith("QuotaFailure"):
+            continue
+        for violation in item.get("violations") or []:
+            if not isinstance(violation, dict):
+                continue
+            if "perday" in str(violation.get("quotaId", "")).lower():
+                return True
+    return False
 
 # Gemini finish-reason string -> FORGE normalised stop reason.
 _STOP_REASON_MAP = {
@@ -110,16 +173,64 @@ class GeminiProvider(LLMProvider):
         if tools:
             config_kwargs["tools"] = [self._to_gemini_tools(tools, types)]
 
-        try:
-            response = client.models.generate_content(
-                model=self._model,
-                contents=contents,
-                config=types.GenerateContentConfig(**config_kwargs),
-            )
-        except genai_errors.APIError as exc:
-            raise LLMError(f"Gemini API error: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001 - normalise everything to LLMError
-            raise LLMError(f"Gemini request failed: {exc!r}") from exc
+        attempt = 0
+        while True:
+            try:
+                response = client.models.generate_content(
+                    model=self._model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs),
+                )
+                break
+            except genai_errors.APIError as exc:
+                if not _is_rate_limit_error(exc):
+                    # Anything that isn't a rate limit (auth, malformed
+                    # request, unsupported schema, ...) would fail
+                    # identically on any provider — not fallback-eligible.
+                    raise LLMError(
+                        f"Gemini API error: {exc}", retryable=False
+                    ) from exc
+                if _is_daily_quota_exhausted(exc):
+                    # A daily quota will not clear within any retry window
+                    # we could reasonably wait — retrying here would only
+                    # waste ~130s+ (3 attempts x the API's own, misleading
+                    # short retryDelay) for zero chance of success. Fail
+                    # fast, with zero sleeps, so FallbackProvider moves to
+                    # the next configured provider immediately.
+                    logger.warning(
+                        "Gemini daily quota exhausted (not a transient "
+                        "per-minute rate limit); skipping retries and "
+                        "falling back immediately."
+                    )
+                    raise LLMError(
+                        f"Gemini API error: {exc}", retryable=True
+                    ) from exc
+                if attempt >= _RATE_LIMIT_MAX_RETRIES:
+                    # Rate limit persisted past our internal retry budget —
+                    # still a transient/provider-availability condition, so
+                    # a different provider is a reasonable next step.
+                    raise LLMError(
+                        f"Gemini API error: {exc}", retryable=True
+                    ) from exc
+                delay = _rate_limit_retry_delay_s(exc)
+                if delay is None:
+                    delay = _RATE_LIMIT_DEFAULT_BACKOFF_S * (2**attempt)
+                attempt += 1
+                logger.warning(
+                    "Gemini rate limited (429); retrying in %.1fs "
+                    "(attempt %d/%d)",
+                    delay,
+                    attempt,
+                    _RATE_LIMIT_MAX_RETRIES,
+                )
+                time.sleep(delay)
+            except Exception as exc:  # noqa: BLE001 - normalise everything to LLMError
+                # Unclassified failure talking to the SDK/transport (e.g. a
+                # connection error) — treated as provider-availability, so
+                # fallback to a different provider is reasonable.
+                raise LLMError(
+                    f"Gemini request failed: {exc!r}", retryable=True
+                ) from exc
 
         return self._to_llm_response(response)
 

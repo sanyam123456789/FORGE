@@ -5,6 +5,7 @@ forge.cli — minimal command-line entry point.
     forge tasks
     forge evaluate --suite-task-id create-string-utils
     forge experiment --suite-dir experiments/tasks
+    forge demo --task-id create-string-utils
     forge analyze --results runs/experiments/<experiment_id>/results.jsonl
 
 `run` executes the agent once and prints a summary.  `tasks` lists the
@@ -15,12 +16,17 @@ one task under one controlled strategy configuration and appends a structured
 the formal 2x2 controlled experiment (Step 7): every selected task under all
 four arms (fixed_raw, fixed_managed, adaptive_raw, adaptive_managed), each in
 its own isolated workspace, writing one JSONL results file plus a metadata
-file per experiment run.  `analyze` (Step 8) reads a results JSONL file (and,
-if present, its metadata.json) and writes a reproducible, machine-readable
-statistical comparison across the arms — descriptive statistics and paired
-comparisons only, no p-values or significance labels; see
-docs/step-08-statistical-analysis.md. It never calls a provider or the
-network.
+file per experiment run.  `demo` (Step 10) is a thin, additive wrapper around
+the same machinery as `experiment` — one task across the four arms, written
+to ``runs/step10_demo/`` by default — that prints a rich per-cell summary
+(provider, model, whether fallback occurred, checker status, tool/LLM-call
+counts, tokens, latency, errors) for a clean, viva-ready walkthrough; it adds
+no new agent, provider, or evaluation logic.  `analyze` (Step 8) reads a
+results JSONL file (and, if present, its metadata.json) and writes a
+reproducible, machine-readable statistical comparison across the arms —
+descriptive statistics and paired comparisons only, no p-values or
+significance labels; see docs/step-08-statistical-analysis.md. It never
+calls a provider or the network.
 
 run options:
     --task TEXT              the coding task (required)
@@ -63,6 +69,21 @@ experiment options:
     and will consume real quota. Use a small --task-id/--arm subset for a
     quick check; see docs/step-07-controlled-2x2-experiment.md for how to
     drive it with a scripted/fake provider instead (as the test suite does).
+
+demo options (Step 10):
+    --suite-dir PATH         task suite dir (default: experiments/tasks)
+    --task-id ID             task to run (default: create-string-utils)
+    --arm ARM_ID             restrict to this arm (repeatable; default: all four)
+    --output-dir PATH        where to write <demo_id>/ (default: runs/step10_demo)
+    --demo-id ID             override the generated demo/experiment id
+    --label TEXT             optional batch label recorded with every result
+    --model                  override the model name
+    --max-turns N            max LLM turns per cell (default: 10)
+    --max-tool-calls N       max tool calls per cell (default: 12)
+    --temperature / --no-trace / --json
+
+    NOTE: same real-provider/quota caveat as `experiment` — this makes real
+    API calls (through the same provider/fallback path) once per arm run.
 
 analyze options:
     --results PATH           results JSONL file to analyze (required)
@@ -186,6 +207,42 @@ def _build_parser() -> argparse.ArgumentParser:
     exp.add_argument("--temperature", type=float, default=None, help="sampling temperature")
     exp.add_argument("--no-trace", action="store_true", help="do not write per-run JSONL traces")
     exp.add_argument("--json", action="store_true", help="print the experiment summary as JSON")
+
+    demo = sub.add_parser(
+        "demo",
+        help="Step 10: clean end-to-end demo of one task across the four arms",
+    )
+    demo.add_argument(
+        "--suite-dir", default=None,
+        help="task suite directory (default: experiments/tasks)",
+    )
+    demo.add_argument(
+        "--task-id", default="create-string-utils",
+        help="task from the baseline suite to run (default: create-string-utils)",
+    )
+    demo.add_argument(
+        "--arm", dest="arm_ids", action="append", default=None,
+        choices=["fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed"],
+        help="restrict to this arm (repeatable; default: all four)",
+    )
+    demo.add_argument(
+        "--output-dir", default=None,
+        help="where to write <demo_id>/ (default: runs/step10_demo)",
+    )
+    demo.add_argument("--demo-id", default=None, help="override the generated demo/experiment id")
+    demo.add_argument("--label", default=None, help="optional batch label recorded with every result")
+    demo.add_argument("--model", default=None, help="override the model name")
+    demo.add_argument(
+        "--max-turns", type=int, default=10,
+        help="max LLM turns per cell (default: 10, matching the Step 9 convention)",
+    )
+    demo.add_argument(
+        "--max-tool-calls", type=int, default=12,
+        help="max tool calls per cell (default: 12, matching the Step 9 convention)",
+    )
+    demo.add_argument("--temperature", type=float, default=None, help="sampling temperature")
+    demo.add_argument("--no-trace", action="store_true", help="do not write per-run JSONL traces")
+    demo.add_argument("--json", action="store_true", help="print the full demo result as JSON")
 
     an = sub.add_parser(
         "analyze",
@@ -540,6 +597,123 @@ def _experiment_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _demo_command(args: argparse.Namespace) -> int:
+    """Step 10: a clean, viva-ready end-to-end demo.
+
+    Deliberately a thin wrapper around the exact same ``MatrixRunner`` path
+    ``forge experiment`` uses (Step 7) — no new agent, provider, or
+    evaluation logic. It differs only in defaults (one task, a dedicated
+    ``runs/step10_demo/`` output directory, bounded --max-turns/--max-tool-
+    calls matching the Step 9 convention) and in printing a richer per-cell
+    summary (provider, model, whether fallback occurred, checker status,
+    tool/LLM-call counts, tokens, latency, errors) instead of just the
+    per-arm aggregate table ``forge experiment`` prints.
+    """
+    import os
+
+    from forge.config import load_settings
+    from forge.evaluation import ARMS, MatrixRunner, arms_by_ids
+    from forge.evaluation.suite import DEFAULT_TASKS_DIR, TaskSuiteError, get_task
+    from forge.llm import get_provider
+    from forge.logging import setup_logging
+
+    if args.model:
+        os.environ["FORGE_LLM_MODEL"] = args.model
+
+    settings = load_settings()
+    setup_logging(level=settings.log_level, fmt=settings.log_format)
+
+    tasks_dir = Path(args.suite_dir) if args.suite_dir else DEFAULT_TASKS_DIR
+    try:
+        task = get_task(args.task_id, tasks_dir=tasks_dir)
+    except (OSError, TaskSuiteError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        arms = arms_by_ids(args.arm_ids) if args.arm_ids else ARMS
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # Fail fast on a provider/key problem before running anything, exactly
+    # like every other real-provider command.
+    try:
+        get_provider(settings_override=settings).preflight()
+    except (ImportError, NotImplementedError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # The provider actually configured as primary — used only to derive
+    # whether a given cell's result came from a fallback, never fabricated.
+    primary_provider = (
+        settings.provider_order[0] if settings.provider_order else settings.llm_provider
+    )
+
+    output_root = Path(args.output_dir) if args.output_dir else Path("runs") / "step10_demo"
+
+    if not args.json:
+        print(f"FORGE {__version__}  demo (Step 10)  provider={settings.llm_provider} model={settings.llm_model}")
+        print(f"task:  {task.task_id}")
+        print(f"arms:  {[a.arm_id for a in arms]}")
+        print(f"output: {output_root}\n")
+
+    runner = MatrixRunner(
+        settings=settings,
+        output_root=output_root,
+        write_trace=not args.no_trace,
+    )
+    results, summary = runner.run(
+        [task],
+        arms=arms,
+        experiment_id=args.demo_id,
+        label=args.label,
+    )
+
+    rows = []
+    for r in results:
+        rows.append(
+            {
+                "task_id": r.task_id,
+                "arm_id": r.arm_id,
+                "provider": r.provider,
+                "model": r.model,
+                "fallback_occurred": r.provider != primary_provider,
+                "status": r.status,
+                "success": r.success,
+                "checks_passed": r.checks_passed,
+                "llm_calls": r.llm_calls,
+                "tool_calls": r.tool_calls,
+                "total_tokens": r.total_tokens,
+                "duration_s": r.duration_s,
+                "error": r.error,
+                "trace_path": r.trace_path,
+                "workspace": r.workspace,
+            }
+        )
+
+    if args.json:
+        print(json.dumps({"summary": summary.to_dict(), "results": rows}, indent=2))
+        return 0
+
+    print(f"demo_id: {summary.experiment_id}")
+    print(f"results file: {summary.results_file}\n")
+    for row in rows:
+        print(f"--- {row['task_id']} / {row['arm_id']} ---")
+        print(f"  provider: {row['provider']}   model: {row['model']}   fallback_occurred: {row['fallback_occurred']}")
+        print(f"  status: {row['status']}   success: {row['success']}   checks_passed: {row['checks_passed']}")
+        print(f"  llm_calls: {row['llm_calls']}   tool_calls: {row['tool_calls']}   total_tokens: {row['total_tokens']}   duration_s: {row['duration_s']}")
+        if row["error"]:
+            print(f"  error: {row['error']}")
+        print(f"  trace: {row['trace_path']}")
+        print(f"  workspace: {row['workspace']}")
+        print()
+
+    successes = sum(1 for r in rows if r["success"])
+    print(f"{successes}/{len(rows)} cell(s) succeeded.")
+    return 0
+
+
 def _analyze_command(args: argparse.Namespace) -> int:
     from forge.evaluation.analysis import run_analysis, write_analysis_json
     from forge.evaluation.matrix import arms_by_ids
@@ -618,6 +792,8 @@ def main(argv: list[str] | None = None) -> int:
         return _evaluate_command(args)
     if args.command == "experiment":
         return _experiment_command(args)
+    if args.command == "demo":
+        return _demo_command(args)
     if args.command == "analyze":
         return _analyze_command(args)
     parser.print_help()

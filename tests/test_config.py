@@ -55,6 +55,25 @@ class TestDefaultSettings:
         s = load_settings()
         assert isinstance(s.workspace_root, Path)
 
+    def test_provider_order_empty_by_default(self, clean_env):
+        s = load_settings()
+        assert s.provider_order == ()
+
+    def test_groq_cerebras_keys_and_models_empty_by_default(self, clean_env):
+        s = load_settings()
+        assert s.groq_api_key == ""
+        assert s.groq_model == ""
+        assert s.cerebras_api_key == ""
+        assert s.cerebras_model == ""
+
+    def test_provider_retry_max_default(self, clean_env):
+        s = load_settings()
+        assert s.provider_retry_max == 3
+
+    def test_llm_request_timeout_default_none(self, clean_env):
+        s = load_settings()
+        assert s.llm_request_timeout_s is None
+
 
 class TestEnvOverrides:
     """load_settings() respects environment variable overrides."""
@@ -99,6 +118,44 @@ class TestEnvOverrides:
         s = load_settings()
         assert s.log_dir == Path("my_logs")
 
+    def test_llm_api_key_still_works_unchanged(self, clean_env, monkeypatch):
+        """Correction from the user: FORGE_LLM_API_KEY must keep working as
+        the (legacy-named but still primary) Gemini key — no rename
+        required, no FORGE_GEMINI_API_KEY needed."""
+        monkeypatch.setenv("FORGE_LLM_API_KEY", "existing-gemini-key")
+        s = load_settings()
+        assert s.llm_api_key == "existing-gemini-key"
+
+    def test_provider_order_parsed_and_lowercased(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_PROVIDER_ORDER", "Gemini, groq ,CEREBRAS")
+        s = load_settings()
+        assert s.provider_order == ("gemini", "groq", "cerebras")
+
+    def test_provider_order_unset_stays_empty(self, clean_env):
+        s = load_settings()
+        assert s.provider_order == ()
+
+    def test_groq_cerebras_env_overrides(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_GROQ_API_KEY", "groq-key")
+        monkeypatch.setenv("FORGE_GROQ_MODEL", "llama-3.3-70b-versatile")
+        monkeypatch.setenv("FORGE_CEREBRAS_API_KEY", "cerebras-key")
+        monkeypatch.setenv("FORGE_CEREBRAS_MODEL", "llama3.3-70b")
+        s = load_settings()
+        assert s.groq_api_key == "groq-key"
+        assert s.groq_model == "llama-3.3-70b-versatile"
+        assert s.cerebras_api_key == "cerebras-key"
+        assert s.cerebras_model == "llama3.3-70b"
+
+    def test_provider_retry_max_override(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_PROVIDER_RETRY_MAX", "5")
+        s = load_settings()
+        assert s.provider_retry_max == 5
+
+    def test_request_timeout_override(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_REQUEST_TIMEOUT_S", "30")
+        s = load_settings()
+        assert s.llm_request_timeout_s == 30.0
+
 
 class TestValidation:
     """load_settings() raises ValueError for invalid values."""
@@ -121,6 +178,21 @@ class TestValidation:
     def test_invalid_max_tool_calls_type(self, clean_env, monkeypatch):
         monkeypatch.setenv("FORGE_MAX_TOOL_CALLS", "not_a_number")
         with pytest.raises(ValueError, match="FORGE_MAX_TOOL_CALLS"):
+            load_settings()
+
+    def test_provider_order_rejects_unknown_provider(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_PROVIDER_ORDER", "gemini,openai")
+        with pytest.raises(ValueError, match="FORGE_PROVIDER_ORDER"):
+            load_settings()
+
+    def test_request_timeout_rejects_non_numeric(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_REQUEST_TIMEOUT_S", "soon")
+        with pytest.raises(ValueError, match="FORGE_LLM_REQUEST_TIMEOUT_S"):
+            load_settings()
+
+    def test_request_timeout_rejects_negative(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_LLM_REQUEST_TIMEOUT_S", "-1")
+        with pytest.raises(ValueError, match="minimum"):
             load_settings()
 
 
@@ -178,6 +250,14 @@ class TestSecretRedaction:
     def test_repr_no_key_shows_not_set(self, clean_env):
         s = load_settings()
         assert "<not set>" in repr(s)
+
+    def test_repr_redacts_groq_and_cerebras_keys(self, clean_env, monkeypatch):
+        monkeypatch.setenv("FORGE_GROQ_API_KEY", "sk-groq-secret")
+        monkeypatch.setenv("FORGE_CEREBRAS_API_KEY", "sk-cerebras-secret")
+        s = load_settings()
+        representation = repr(s)
+        assert "sk-groq-secret" not in representation
+        assert "sk-cerebras-secret" not in representation
 
 
 class TestSettingsImmutability:
