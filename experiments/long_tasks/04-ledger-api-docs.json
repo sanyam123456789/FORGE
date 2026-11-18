@@ -1,0 +1,11 @@
+{
+  "task_id": "ledger-api-docs",
+  "prompt": "Write API.md at the workspace root documenting the public API of the ledger package. Use one section per module, with the heading `## ledger.<module>` (for example `## ledger.money`), for every module in ledger/ except __init__.py. In each section list every public function and class defined at the top level of that module (names that do not start with an underscore), each with a one-line description of what it does, based on the actual code. Do not change any code.",
+  "fixtures": { "dir": "fixtures/ledger" },
+  "verify": "verify/ledger-api-docs.py",
+  "metadata": {
+    "category": "documentation",
+    "difficulty": "long",
+    "summary": "Read every module of a ~1,100-line package and document its 62 public names. Hidden check: a section per module, every public name documented, no source changed."
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "task_id": "ledger-fix-bugs",
+  "prompt": "The test suite of this ledger project fails. Run it with `python -m unittest discover -s tests`, find the bugs in the ledger package that cause the failures, and fix them. Do not change any file under tests/. Run the test suite again at the end and make sure every test passes.",
+  "fixtures": { "dir": "fixtures/ledger-bugs" },
+  "verify": "verify/ledger-fix-bugs.py",
+  "metadata": {
+    "category": "debugging",
+    "difficulty": "long",
+    "summary": "Find and fix three bugs in different modules of a ~1,100-line package, guided by a failing test suite. Hidden check: tests unchanged and passing, bugs fixed when tested directly."
+  }
+}

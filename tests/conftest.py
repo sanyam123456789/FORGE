@@ -34,6 +34,9 @@ _FORGE_ENV_KEYS = [
     "FORGE_LOG_DIR",
     "FORGE_SHELL_ENV_ALLOW",
     "FORGE_REPO_MAP",
+    "FORGE_PROJECT_RULES",
+    "FORGE_APPROVE",
+    "FORGE_STREAM",
     # Not FORGE_-prefixed, but read by the opencode_go provider preset.
     "OPENCODE_API_KEY",
 ]
@@ -49,6 +52,27 @@ def clean_env(monkeypatch):
     for key in _FORGE_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_forge_logging():
+    """Undo setup_logging() after each test.
+
+    CLI tests call setup_logging(), which attaches a handler to the
+    (pytest-captured, later closed) stderr and stops forge.* records from
+    reaching the root logger, so later caplog-based tests would see nothing.
+    """
+    yield
+    import logging
+
+    import forge.logging as forge_logging
+
+    root = logging.getLogger(forge_logging.FORGE_LOGGER_NAME)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.propagate = True
+    root.setLevel(logging.NOTSET)
+    forge_logging._logging_configured = False
 
 
 # ---------------------------------------------------------------------------

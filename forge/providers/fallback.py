@@ -52,6 +52,7 @@ never affects a different run's provider choice.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from forge.llm import LLMError, LLMProvider, LLMResponse, Message
@@ -83,6 +84,10 @@ class FallbackProvider(LLMProvider):
         # FallbackProvider (and therefore a fresh, empty set) via
         # get_provider().
         self._down: set[str] = set()
+        # Stream only if every candidate can.
+        self.supports_streaming = all(
+            getattr(c.provider, "supports_streaming", False) for c in self._candidates
+        )
 
     # ------------------------------------------------------------------
     # LLMProvider interface
@@ -131,8 +136,10 @@ class FallbackProvider(LLMProvider):
         tools: list[dict] | None = None,
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        on_text: Callable[[str], None] | None = None,
     ) -> LLMResponse:
         failures: list[str] = []
+        stream_kw = {"on_text": on_text} if on_text is not None else {}
 
         for idx, cand in enumerate(self._candidates):
             if cand.name in self._down:
@@ -165,6 +172,7 @@ class FallbackProvider(LLMProvider):
                     tools=tools,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    **stream_kw,
                 )
             except LLMError as exc:
                 elapsed_ms = (time.monotonic() - t0) * 1000

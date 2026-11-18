@@ -513,6 +513,10 @@ def test_modes_map_to_strategies():
     assert (tools.name, context.name) == ("adaptive", "stable")
     tools, context = build_strategies("baseline")
     assert (tools.name, context.name) == ("fixed", "raw")
+    # Step 12: no mode uses the per-turn managed strategy any more.
+    tools, context = build_strategies("lean-context")
+    assert (tools.name, context.name) == ("fixed", "stable")
+    assert context.compact_at_tokens == 64_000
     with pytest.raises(ValueError):
         get_mode("turbo")
 

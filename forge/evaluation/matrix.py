@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,6 +202,7 @@ class MatrixExperimentSummary:
     output_dir: str
     results_file: str
     label: str | None = None
+    repetitions: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,6 +220,7 @@ class MatrixExperimentSummary:
             "output_dir": self.output_dir,
             "results_file": self.results_file,
             "label": self.label,
+            "repetitions": self.repetitions,
         }
 
     @classmethod
@@ -236,6 +240,7 @@ class MatrixExperimentSummary:
             output_dir=data["output_dir"],
             results_file=data["results_file"],
             label=data.get("label"),
+            repetitions=int(data.get("repetitions") or 1),
         )
 
 
@@ -304,6 +309,9 @@ class MatrixRunner:
         label: str | None = None,
         pricing: TokenPricing | None = None,
         cleanup_workspaces: bool = False,
+        repetitions: int = 1,
+        jobs: int = 1,
+        on_result: Callable[[EvalResult, int, int], None] | None = None,
     ) -> tuple[list[EvalResult], MatrixExperimentSummary]:
         """Run *tasks* x *arms* and return ``(results, summary)``.
 
@@ -323,11 +331,23 @@ class MatrixRunner:
         already turns into a normal, non-raising ``EvalResult``) is caught
         here and recorded as a ``STATUS_RUNNER_ERROR`` result rather than
         aborting the rest of the experiment.
+
+        ``repetitions`` > 1 runs every (task, arm) pair that many times
+        (workspaces ``<task_id>/<arm_id>/rep<n>/``; ``EvalResult.repetition``
+        is set). Repetitions are the outer loop, so a slow drift in provider
+        behaviour spreads evenly over the arms. ``jobs`` > 1 runs that many
+        task-arm executions at once in threads; each still has its own
+        workspace and provider, and the returned list keeps the sequential
+        order. ``on_result(result, done, total)`` is called as each finishes.
         """
         if not tasks:
             raise ValueError("MatrixRunner.run() requires at least one task")
         if not arms:
             raise ValueError("MatrixRunner.run() requires at least one arm")
+        if repetitions < 1:
+            raise ValueError("repetitions must be at least 1")
+        if jobs < 1:
+            raise ValueError("jobs must be at least 1")
 
         experiment_id = experiment_id or _new_experiment_id()
         exp_dir = self._output_root / experiment_id
@@ -340,25 +360,47 @@ class MatrixRunner:
         metadata_file = exp_dir / "metadata.json"
 
         started_at = _utc_now_iso()
-        results: list[EvalResult] = []
+        plan = [
+            (rep, task, arm)
+            for rep in range(1, repetitions + 1)
+            for task in tasks
+            for arm in arms
+        ]
+        slots: list[EvalResult | None] = [None] * len(plan)
+        lock = threading.Lock()
+        done = [0]
 
-        for task in tasks:
-            for arm in arms:
-                result = self._run_one(
-                    task=task,
-                    arm=arm,
-                    experiment_id=experiment_id,
-                    ws_root=ws_root,
-                    trace_dir=trace_dir,
-                    pricing=pricing,
-                    label=label,
-                    cleanup_workspace=cleanup_workspaces,
-                )
-                results.append(result)
+        def execute(index: int) -> None:
+            rep, task, arm = plan[index]
+            result = self._run_one(
+                task=task,
+                arm=arm,
+                experiment_id=experiment_id,
+                ws_root=ws_root,
+                trace_dir=trace_dir,
+                pricing=pricing,
+                label=label,
+                cleanup_workspace=cleanup_workspaces,
+                repetition=rep if repetitions > 1 else None,
+            )
+            with lock:
+                slots[index] = result
                 # Append incrementally: a mid-experiment crash (e.g. Ctrl-C)
                 # still leaves every already-completed task-arm result on
                 # disk, reloadable, rather than losing the whole batch.
                 append_result_jsonl(result, results_file)
+                done[0] += 1
+                if on_result is not None:
+                    on_result(result, done[0], len(plan))
+
+        if jobs == 1:
+            for index in range(len(plan)):
+                execute(index)
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                for future in [pool.submit(execute, i) for i in range(len(plan))]:
+                    future.result()
+        results: list[EvalResult] = [r for r in slots if r is not None]
 
         finished_at = _utc_now_iso()
         summary = MatrixExperimentSummary(
@@ -376,6 +418,7 @@ class MatrixRunner:
             output_dir=str(exp_dir),
             results_file=str(results_file),
             label=label,
+            repetitions=repetitions,
         )
         metadata_file.write_text(
             json.dumps(summary.to_dict(), indent=2, ensure_ascii=False),
@@ -402,10 +445,13 @@ class MatrixRunner:
         pricing: TokenPricing | None,
         label: str | None,
         cleanup_workspace: bool,
+        repetition: int | None = None,
     ) -> EvalResult:
-        # Fresh, isolated workspace: <ws_root>/<task_id>/<arm_id>/ — never
-        # shared with any other (task, arm) pair, never reused across arms.
+        # Fresh, isolated workspace: <ws_root>/<task_id>/<arm_id>/[rep<n>/] —
+        # never shared with any other run, never reused across arms.
         ws_path = ws_root / task.task_id / arm.arm_id
+        if repetition is not None:
+            ws_path = ws_path / f"rep{repetition}"
         experiment_cfg = ExperimentConfig.from_settings(
             self._settings,
             task_id=task.task_id,
@@ -435,6 +481,7 @@ class MatrixRunner:
             )
             result.experiment_id = experiment_id
             result.arm_id = arm.arm_id
+            result.repetition = repetition
             result.task_category = task.metadata.get("category")
             result.exposed_tools = exposed_tools
             if cleanup_workspace:
@@ -445,7 +492,7 @@ class MatrixRunner:
                 "Matrix task-arm failed: experiment=%s task=%s arm=%s",
                 experiment_id, task.task_id, arm.arm_id,
             )
-            return self._error_result(
+            result = self._error_result(
                 task=task,
                 arm=arm,
                 experiment_cfg=experiment_cfg,
@@ -453,6 +500,8 @@ class MatrixRunner:
                 exc=exc,
                 ws_path=ws_path,
             )
+            result.repetition = repetition
+            return result
 
     @staticmethod
     def _exposed_tools(

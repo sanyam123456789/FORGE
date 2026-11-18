@@ -16,8 +16,12 @@ On-disk task file shape::
       "prompt":  "Create a file ...",
       "checks":  [ { "path": "string_utils.py", "must_contain": ["def slugify("] } ],
       "fixtures": { "dir": "fixtures/create-string-utils" },   # optional
-      "metadata": { "category": "file_creation", "difficulty": "easy" }
+      "metadata": { "category": "file_creation", "difficulty": "easy" },
+      "verify":  "verify/create-string-utils.py"            # optional
     }
+
+``verify`` names a hidden Python test script (relative to the task file),
+run after the agent finishes; see ``EvalTask.verify_script``.
 
 ``fixtures`` may also be an inline list of ``{"path": ..., "content": ...}``
 objects (the form produced by ``EvalTask.to_dict``); the ``{"dir": ...}`` form
@@ -36,6 +40,11 @@ from forge.evaluation.task import ArtifactCheck, EvalTask, FixtureFile
 #: (When FORGE is installed as a wheel the ``experiments/`` tree is not
 #: packaged; pass an explicit ``tasks_dir`` in that case.)
 DEFAULT_TASKS_DIR = Path(__file__).resolve().parents[2] / "experiments" / "tasks"
+#: Longer, multi-step tasks whose context grows large enough to exercise the
+#: context strategies (``forge bench --suite long``).
+LONG_TASKS_DIR = Path(__file__).resolve().parents[2] / "experiments" / "long_tasks"
+#: Named suites for ``--suite``.
+SUITES = {"baseline": DEFAULT_TASKS_DIR, "long": LONG_TASKS_DIR}
 
 
 class TaskSuiteError(ValueError):
@@ -76,7 +85,14 @@ def _resolve_fixtures(path: Path, data: dict) -> tuple[FixtureFile, ...]:
         fx_dir = (path.parent / spec["dir"]).resolve()
         if not fx_dir.is_dir():
             raise TaskSuiteError(f"{path}: fixture directory not found: {fx_dir}")
-        files = sorted(p for p in fx_dir.rglob("*") if p.is_file())
+        # Python bytecode caches appear when a fixture's own tests are run
+        # locally; they are never part of a task.
+        files = sorted(
+            p for p in fx_dir.rglob("*")
+            if p.is_file()
+            and "__pycache__" not in p.relative_to(fx_dir).parts
+            and p.suffix != ".pyc"
+        )
         if not files:
             raise TaskSuiteError(f"{path}: fixture directory is empty: {fx_dir}")
         out: list[FixtureFile] = []
@@ -118,6 +134,14 @@ def _build_task(path: Path, data: dict) -> EvalTask:
 
     fixtures = _resolve_fixtures(path, data)
 
+    verify_script: str | None = None
+    if data.get("verify") is not None:
+        verify_path = (path.parent / str(data["verify"])).resolve()
+        try:
+            verify_script = verify_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise TaskSuiteError(f"{path}: cannot read verify script {verify_path} ({exc})") from exc
+
     try:
         return EvalTask(
             task_id=data["task_id"],
@@ -125,6 +149,7 @@ def _build_task(path: Path, data: dict) -> EvalTask:
             checks=checks,
             fixtures=fixtures,
             metadata=metadata,
+            verify_script=verify_script,
         )
     except ValueError as exc:  # EvalTask.__post_init__ validation
         raise TaskSuiteError(f"{path}: {exc}") from exc

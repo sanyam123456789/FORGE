@@ -360,6 +360,8 @@ class AdaptiveToolExposure(ToolExposureStrategy):
                 "execute ",
                 "run it",
                 "run the script",
+                # Step 12.
+                "test suite",
             ),
         ),
         (

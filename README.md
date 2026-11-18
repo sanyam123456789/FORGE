@@ -16,32 +16,49 @@ prompt stay fixed, so the savings can be measured.
 
 ## Results
 
-Benchmark run on 2026-11-18: the 10-task suite under six strategy
-combinations, 60 real runs on OpenCode Go (`deepseek-v4.1-flash`).
+Two benchmarks on OpenCode Go (`deepseek-v4.1-flash`), every arm on the same
+tasks with the same model, prompt and limits.
 
-| Arm | Solved | Avg tokens | Cache hit | Avg LLM calls |
-|---|---:|---:|---:|---:|
-| fixed_raw (baseline) | 10/10 | 7,144 | 76% | 3.8 |
-| adaptive_raw (lean tools) | 10/10 | **5,594** | 73% | 3.4 |
-| fixed_managed | 10/10 | 7,230 | 76% | 3.9 |
-| adaptive_managed | 10/10 | 5,802 | 71% | 3.5 |
-| fixed_stable | 10/10 | 6,988 | 75% | 3.7 |
-| adaptive_stable (`smart`) | 10/10 | 7,252 | 77% | 4.2 |
+**Long tasks** (Step 12, 2026-11-19): 4 multi-step tasks on a ~1,500-line
+project, checked by hidden tests; 3 runs per task and arm, 72 runs.
 
-- **Same results:** every arm solved every task.
-- **Lean tools: 22% fewer tokens** than the baseline (lower on 9 of 10 tasks).
-- **Context strategies: not tested by this suite.** The largest context in
-  any run was about 1k tokens, below every pruning threshold, so raw,
-  managed and stable sent identical requests. Differences between them here
-  are run-to-run noise, which reached 3× on a single task. Measuring them
-  needs longer tasks and repeated runs.
+| Arm | Solved | Avg tokens | vs base | Spread | Uncached input | Cached |
+|---|---:|---:|---:|---:|---:|---:|
+| fixed_raw (baseline) | **12/12** | 153,707 | base | ±23% | **17,969** | **88%** |
+| adaptive_raw (lean tools) | **12/12** | 152,454 | −4% | ±29% | 20,967 | 86% |
+| fixed_stable | **12/12** | 149,694 | +4% | ±31% | 29,140 | 80% |
+| adaptive_stable | **12/12** | 147,989 | +1% | ±29% | 26,907 | 81% |
+| fixed_managed | 5/12 | 174,851 | +25% | ±17% | 94,182 | 45% |
+| adaptive_managed | 4/12 | 170,469 | +21% | ±23% | 86,083 | 48% |
+
+**Short tasks** (Step 11, 2026-11-18): the 10-task baseline suite, one run
+each, 60 runs. Every arm solved 10/10; lean tools used **22% fewer tokens**
+than the baseline (5,594 vs 7,144 on average, lower on 9 of 10 tasks).
+
+What this means:
+
+- **Prompt caching does most of the saving.** 86–88% of input tokens were
+  served from cache when the history is sent unchanged. Keeping the prompt
+  prefix stable matters more than shrinking it.
+- **Pruning the history every turn backfires.** The Step 6 managed context
+  compressed file contents the model still needed; it re-read them until
+  it hit the tool-call limit, solving 9 of 24 runs. No mode uses it any
+  more.
+- **Occasional compaction (stable) was safe but saved nothing** on these
+  tasks, and cost more uncached input. It now waits until a conversation
+  reaches 64k tokens, so normal tasks get the full cache benefit.
+- **Lean tools save tokens when a task needs only a few tools** (−22% on the
+  short suite); on long tasks that need every tool it changes little.
+- **Run-to-run noise is ±17–31%**, sometimes 3×. Differences smaller than
+  that are not results.
 - **Earlier manual benchmark** (other providers): FORGE used 4–25× fewer
   tokens than an external agent running the same model, with the same
   correct output
   ([details](docs/benchmark-forge-vs-external-agents.md)).
 
-Full tables and caveats: [`docs/step-11-benchmark-results.md`](docs/step-11-benchmark-results.md).
-Reproduce with `forge bench`, then `forge report`.
+Full tables: [long tasks](docs/step-12-benchmark-results.md),
+[short tasks](docs/step-11-benchmark-results.md). Reproduce with
+`forge bench --suite long --repeat 3` or `forge bench`, then `forge report`.
 
 ## Quick start
 
@@ -62,7 +79,8 @@ forge "fix the bug in average() in stats.py"     # one task
 forge chat                                         # a conversation
 ```
 
-A run ends with one line, for example:
+The reply streams in as it is written, with a line per tool call, and a run
+ends with one line, for example:
 
 ```
 ✓ Done · 4 turns · 6.8k tokens · 61% cached · 15.4s
@@ -79,13 +97,18 @@ forge "..." --mode baseline --verbose
 ```
 
 Options: `--mode`, `--workspace`, `--model`, `--max-turns`,
-`--max-tool-calls`, `--temperature`, `--json`, `--quiet`, `--verbose`,
+`--max-tool-calls`, `--temperature`, `--approve` (ask before every file
+edit and shell command), `--no-stream`, `--json`, `--quiet`, `--verbose`,
 `--no-trace`. `forge run "..."` and `forge run --task "..."` also work.
+Ctrl+C stops a run cleanly.
 
 ### Chat
 
 `forge chat` keeps one conversation, so follow-ups build on what FORGE
-already knows. Type tasks in plain words; everything else is a slash command:
+already knows. It is saved after every task: `forge chat --resume` continues
+the newest conversation for the current folder (or `--resume <id>`), even
+after FORGE was closed. Ctrl+C stops the current task and the conversation
+stays usable. Type tasks in plain words; everything else is a slash command:
 
 | Command | What it does |
 |---|---|
@@ -97,10 +120,25 @@ already knows. Type tasks in plain words; everything else is a slash command:
 | `/tools` | Tools offered on the last request |
 | `/compact` | Compact the context on the next request |
 | `/diff [all]` | File changes from the last task (or the whole session) |
-| `/undo` | Revert the file changes of the last task |
+| `/undo` | Revert the file changes of the last task (also after Ctrl+C) |
+| `/approve [on\|off]` | Ask before every file edit and shell command |
+| `/sessions` | Saved conversations for this folder |
 | `/clear` | Start a fresh conversation |
 | `/workspace [path]` | Show or change the folder FORGE works in |
 | `/exit` | Quit |
+
+With approval on (`--approve` or `/approve on`), FORGE shows each edit as a
+small diff, each new file and each command, and asks: `y` runs it, `n` skips
+it, `a` allows that tool for the rest of the session, and anything else you
+type skips it and is passed to the agent as your instruction.
+
+### Project rules (`AGENTS.md`)
+
+Put project conventions in `AGENTS.md` (or `FORGE.md`) in the workspace
+root: test commands, style rules, folders not to touch. FORGE adds the file
+to the system prompt once, so it sits in the cached part of every request
+instead of being repeated in each task. `FORGE_PROJECT_RULES=false` turns
+this off.
 
 ### Modes
 
@@ -108,16 +146,26 @@ already knows. Type tasks in plain words; everything else is a slash command:
 |---|---|---|---|
 | `baseline` | all, every turn | full history every turn | the reference point |
 | `lean-tools` | only what the task needs | full history | |
-| `lean-context` | all | managed (pruned, compressed) | |
-| `smart` | only what the task needs | managed **and** cache-friendly | **default** |
+| `lean-context` | all | full history, compacted once it passes 64k tokens | |
+| `smart` | only what the task needs | full history, compacted once it passes 64k tokens | **default** |
+
+Below 64k tokens `smart` sends exactly what `lean-tools` sends; the
+compaction is a safety net for very long chats.
 
 ### Benchmark and report
 
 ```bash
 forge bench                      # every suite task under all six arms, then the report
+forge bench --suite long --repeat 3 --jobs 4   # long tasks, 3 runs each, 4 at a time
 forge bench --task-id fix-inclusive-sum --arm fixed_raw --arm adaptive_stable
 forge report                     # table for the newest results (or pass a results.jsonl)
 ```
+
+Two suites: `baseline` (10 short tasks) and `long` (4 multi-step tasks on a
+~1,500-line project, checked by hidden test scripts the agent never sees).
+`--repeat N` runs every task-arm N times; the report then shows the
+run-to-run spread next to each arm's change against the baseline, so a
+difference smaller than the noise is visible as such.
 
 The research commands are unchanged: `forge tasks`, `forge evaluate`,
 `forge experiment` (the formal 2×2), `forge demo` and `forge analyze`
@@ -125,12 +173,15 @@ The research commands are unchanged: `forge tasks`, `forge evaluate`,
 
 ## How FORGE saves tokens
 
-**Cache-friendly context (`smart` mode).** Providers bill cached input
-tokens at a fraction of the price, but only for an *unchanged prefix* of
-the request. FORGE's managed context (pruning stale tool output, keeping
-errors and recent turns) is applied in occasional batches. Between batches
-every request is the previous one plus new messages, so the cache keeps
-working. See [`docs/step-11-token-savers.md`](docs/step-11-token-savers.md).
+**Cache-friendly context.** Providers bill cached input tokens at a
+fraction of the price, but only for an *unchanged prefix* of the request.
+FORGE keeps every request equal to the previous one plus new messages, so
+86–88% of input is served from cache on long tasks. Only when a
+conversation passes 64k tokens does it compact once (pruning stale tool
+output, keeping errors and recent turns) and then stay append-only again.
+Pruning on every turn was measured and rejected: it broke the cache and
+made the model re-read files
+([results](docs/step-12-benchmark-results.md)).
 
 **Lean tool exposure.** Only the tools a task needs are sent. If FORGE
 guessed wrong, the model calls a tiny `enable_tool` tool to turn one on, so
@@ -143,6 +194,9 @@ a task never gets stuck.
   text again.
 - Repeated failures and stalls get a nudge to change approach.
 - Cut-off replies are continued instead of being taken as the answer.
+
+**Project rules once, in the cached prefix.** `AGENTS.md` is part of the
+system prompt, so it is billed at the cached rate after the first request.
 
 **Measured, not guessed.** Every run writes a JSONL trace with the
 provider's own token counts, including cached tokens. Context budgets use
@@ -176,6 +230,9 @@ FORGE reads settings from the environment; `.env` is loaded automatically.
 | `FORGE_MAX_LLM_TURNS` | `30` | Turn limit per task; `0` = unlimited |
 | `FORGE_MAX_TOOL_CALLS` | `50` | Tool-call limit per task; `0` = unlimited |
 | `FORGE_REPO_MAP` | `true` | Put the workspace file list in the first message |
+| `FORGE_PROJECT_RULES` | `true` | Add `AGENTS.md` / `FORGE.md` to the system prompt |
+| `FORGE_STREAM` | `true` | Stream reply text as it arrives |
+| `FORGE_APPROVE` | `false` | Ask before every file edit and shell command |
 | `FORGE_LLM_TEMPERATURE` | `0.0` | Sampling temperature |
 | `FORGE_LLM_REQUEST_TIMEOUT_S` | `120` | Per-request timeout |
 | `FORGE_PROVIDER_RETRY_MAX` | `3` | Retries for 429 / 5xx / connection errors |
@@ -197,7 +254,8 @@ task / chat message
       → RunTracer (forge/observability.py)   → logs/<run_id>.jsonl
   → AgentRun (answer, tokens, cache hits, context stats)
 
-forge/chat.py      conversation, slash commands, /diff and /undo
+forge/chat.py      conversation, slash commands, /diff and /undo, approval prompts
+forge/sessions.py  saved conversations (forge chat --resume)
 forge/modes.py     baseline / lean-tools / lean-context / smart
 forge/evaluation/  tasks, runner, 2×2 matrix, analysis, report
 ```
@@ -219,12 +277,13 @@ The safety layer is a **heuristic, not a sandbox**:
   from output.
 - It does **not** stop interpreter one-liners or network access from
   inside an allowed program. Use FORGE on workspaces you can afford to
-  lose, or under version control.
+  lose, or under version control, or turn on approval (`--approve`) to
+  confirm every edit and command yourself.
 
 ## Tests
 
 ```bash
-pytest            # 659 tests, no API key or network needed
+pytest            # 710 tests, no API key or network needed
 ```
 
 ## Project history
@@ -238,6 +297,7 @@ pytest            # 659 tests, no API key or network needed
 | 7–8 | Formal 2×2 experiment, statistical analysis | [step-07](docs/step-07-controlled-2x2-experiment.md), [step-08](docs/step-08-statistical-analysis.md) |
 | 9 | Real-provider pilots, external-agent benchmark | [step-09](docs/step-09-research-multitask-analysis.md), [benchmark](docs/benchmark-forge-vs-external-agents.md) |
 | 11 | Cache-friendly context, token savers, chat, modes, bench/report | [step-11](docs/step-11-token-savers.md), [results](docs/step-11-benchmark-results.md) |
+| 12 | Long-task benchmark with repeats, streaming, project rules, saved chats, approval, chat-safe interrupts | [step-12](docs/step-12-long-tasks-and-chat.md) |
 
 ## Not included (by design)
 

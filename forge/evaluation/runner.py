@@ -169,6 +169,7 @@ class EvaluationRunner:
             turns=agent_run.turns,
             reasoning_tokens=agent_run.reasoning_tokens,
             cached_input_tokens=agent_run.cached_input_tokens,
+            peak_input_tokens=agent_run.peak_input_tokens,
             context_messages=agent_run.context_messages,
             context_char_count=agent_run.context_char_count,
             context_items_dropped=agent_run.context_items_dropped,

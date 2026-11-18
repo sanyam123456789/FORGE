@@ -174,6 +174,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--json", action="store_true", help="print the run summary as JSON")
     run.add_argument("--quiet", action="store_true", help="only print the final answer")
     run.add_argument("--verbose", action="store_true", help="print every run metric")
+    run.add_argument("--approve", action="store_true",
+                     help="ask before every file edit and shell command")
+    run.add_argument("--no-stream", action="store_true",
+                     help="print the reply when it is complete instead of as it arrives")
 
     chat = sub.add_parser("chat", help="interactive session with /slash commands")
     chat.add_argument("--mode", default="smart", choices=_MODE_NAMES,
@@ -181,13 +185,24 @@ def _build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--workspace", default=None, help="workspace root (default: cwd)")
     chat.add_argument("--model", default=None, help="override the model name")
     chat.add_argument("--no-trace", action="store_true", help="do not write JSONL traces")
+    chat.add_argument("--resume", nargs="?", const="latest", default=None, metavar="ID",
+                      help="continue a saved conversation: the newest for this "
+                           "workspace, or the given session id")
+    chat.add_argument("--approve", action="store_true",
+                      help="ask before every file edit and shell command (/approve)")
+    chat.add_argument("--no-stream", action="store_true",
+                      help="print replies when complete instead of as they arrive")
 
     rep = sub.add_parser("report", help="readable per-arm table of experiment results")
     rep.add_argument("results", nargs="?", default=None,
                      help="results JSONL (default: newest results.jsonl under runs/)")
     rep.add_argument("--json", action="store_true", help="print the report as JSON")
 
-    tk = sub.add_parser("tasks", help="list the baseline evaluation task suite")
+    tk = sub.add_parser("tasks", help="list an evaluation task suite")
+    tk.add_argument(
+        "--suite", default="baseline", choices=["baseline", "long"],
+        help="which suite to list (default: baseline)",
+    )
     tk.add_argument(
         "--suite-dir", default=None,
         help="task suite directory (default: experiments/tasks)",
@@ -309,8 +324,21 @@ def _build_parser() -> argparse.ArgumentParser:
 def _add_matrix_args(p: argparse.ArgumentParser, *, default_arms: str) -> None:
     """Arguments shared by `experiment` and `bench`."""
     p.add_argument(
+        "--suite", default="baseline", choices=["baseline", "long"],
+        help="task suite: baseline (10 short tasks) or long (multi-step tasks "
+             "with hidden tests; default: baseline)",
+    )
+    p.add_argument(
         "--suite-dir", default=None,
-        help="task suite directory (default: experiments/tasks)",
+        help="task suite directory (overrides --suite)",
+    )
+    p.add_argument(
+        "--repeat", type=int, default=1, metavar="N",
+        help="run every task-arm N times, to measure run-to-run variation (default: 1)",
+    )
+    p.add_argument(
+        "--jobs", type=int, default=1, metavar="N",
+        help="run N task-arms at the same time (default: 1)",
     )
     p.add_argument(
         "--task-id", dest="task_ids", action="append", default=None,
@@ -341,7 +369,7 @@ def _run_command(args: argparse.Namespace) -> int:
     import os
 
     from forge.agent import STATUS_COMPLETED, AgentConfig, AgentRuntime
-    from forge.chat import result_line
+    from forge.chat import TerminalApprover, TerminalOutput, result_line
     from forge.config import load_settings
     from forge.llm import get_provider
     from forge.logging import setup_logging
@@ -358,7 +386,12 @@ def _run_command(args: argparse.Namespace) -> int:
         os.environ["FORGE_WORKSPACE_ROOT"] = str(Path(args.workspace).resolve())
 
     settings = load_settings()
-    setup_logging(level=settings.log_level, fmt=settings.log_format)
+    # Routine INFO log lines would interleave with the streamed reply; show
+    # them only with --verbose (an explicitly chosen level such as DEBUG is kept).
+    level = settings.log_level
+    if level == "INFO" and not args.verbose:
+        level = "WARNING"
+    setup_logging(level=level, fmt=settings.log_format)
 
     try:
         provider = get_provider(settings_override=settings)
@@ -381,19 +414,25 @@ def _run_command(args: argparse.Namespace) -> int:
         max_tool_calls=args.max_tool_calls,
         temperature=args.temperature,
     )
+    interactive = not (args.quiet or args.json)
+    output = TerminalOutput()
+    stream = interactive and settings.stream and not args.no_stream
+    approve = None
+    if args.approve or settings.approve:
+        approve = TerminalApprover(before_prompt=output.end_reply)
     runtime = AgentRuntime(
         config,
         provider=provider,
         workspace_root=settings.workspace_root,
         write_trace=not args.no_trace,
         log_dir=settings.log_dir,
-        on_tool_call=(
-            None if (args.quiet or args.json) else
-            lambda name, a: print(f"  · {name} {_brief_args(a)}")
-        ),
+        on_tool_call=output.tool if interactive else None,
+        on_text=output.text if stream else None,
+        approve=approve,
     )
 
     run = runtime.run()
+    output.end_reply()
 
     summary = {
         "run_id": run.run_id,
@@ -412,6 +451,8 @@ def _run_command(args: argparse.Namespace) -> int:
         "duplicate_reads_collapsed": run.duplicate_reads_collapsed,
         "hidden_tool_calls_refused": run.hidden_tool_calls_refused,
         "length_continuations": run.length_continuations,
+        "peak_input_tokens": run.peak_input_tokens,
+        "actions_declined": run.actions_declined,
         "trace_path": str(run.trace_path) if run.trace_path else None,
         "error": run.error,
     }
@@ -421,8 +462,9 @@ def _run_command(args: argparse.Namespace) -> int:
     elif args.quiet:
         print(run.final_answer)
     else:
-        print()
-        print(run.final_answer.strip() if run.final_answer else "(no final answer)")
+        if not (output.streamed and run.final_answer):
+            print()
+            print(run.final_answer.strip() if run.final_answer else "(no final answer)")
         if run.error:
             print(f"error: {run.error}")
         print()
@@ -457,9 +499,9 @@ def _load_eval_task(args: argparse.Namespace):
 
 
 def _tasks_command(args: argparse.Namespace) -> int:
-    from forge.evaluation.suite import DEFAULT_TASKS_DIR, TaskSuiteError, load_suite
+    from forge.evaluation.suite import SUITES, TaskSuiteError, load_suite
 
-    tasks_dir = Path(args.suite_dir) if args.suite_dir else DEFAULT_TASKS_DIR
+    tasks_dir = Path(args.suite_dir) if args.suite_dir else SUITES[args.suite]
     try:
         tasks = load_suite(tasks_dir)
     except (OSError, TaskSuiteError) as exc:
@@ -470,7 +512,8 @@ def _tasks_command(args: argparse.Namespace) -> int:
         print(json.dumps([t.to_dict() for t in tasks], indent=2))
         return 0
 
-    print(f"baseline task suite: {tasks_dir}  ({len(tasks)} tasks)\n")
+    name = "task suite" if args.suite_dir else f"{args.suite} task suite"
+    print(f"{name}: {tasks_dir}  ({len(tasks)} tasks)\n")
     print(f"  {'task_id':<30} {'category':<14} {'diff':<7} checks fixtures")
     print(f"  {'-' * 30} {'-' * 14} {'-' * 7} {'-' * 6} {'-' * 8}")
     for t in tasks:
@@ -478,7 +521,7 @@ def _tasks_command(args: argparse.Namespace) -> int:
         diff = str(t.metadata.get("difficulty", "-"))
         print(
             f"  {t.task_id:<30} {cat:<14} {diff:<7} "
-            f"{len(t.checks):<6} {len(t.fixtures)}"
+            f"{len(t.checks) + (1 if t.verify_script else 0):<6} {len(t.fixtures)}"
         )
     return 0
 
@@ -599,17 +642,21 @@ def _experiment_command(args: argparse.Namespace) -> int:
         aggregate_results,
         arms_by_ids,
     )
-    from forge.evaluation.suite import DEFAULT_TASKS_DIR, TaskSuiteError, load_suite
+    from forge.evaluation.suite import SUITES, TaskSuiteError, load_suite
     from forge.llm import get_provider
     from forge.logging import setup_logging
 
     if args.model:
         os.environ["FORGE_LLM_MODEL"] = args.model
 
+    if args.repeat < 1 or args.jobs < 1:
+        print("error: --repeat and --jobs must be at least 1", file=sys.stderr)
+        return 2
+
     settings = load_settings()
     setup_logging(level=settings.log_level, fmt=settings.log_format)
 
-    tasks_dir = Path(args.suite_dir) if args.suite_dir else DEFAULT_TASKS_DIR
+    tasks_dir = Path(args.suite_dir) if args.suite_dir else SUITES[args.suite]
     try:
         suite = load_suite(tasks_dir)
     except (OSError, TaskSuiteError) as exc:
@@ -654,6 +701,8 @@ def _experiment_command(args: argparse.Namespace) -> int:
         print(f"FORGE {__version__}  {args.command}  provider={settings.llm_provider} model={settings.llm_model}")
         print(f"tasks: {[t.task_id for t in tasks]}")
         print(f"arms:  {[a.arm_id for a in arms]}")
+        if args.repeat > 1 or args.jobs > 1:
+            print(f"repetitions: {args.repeat}   parallel jobs: {args.jobs}")
         print(f"output: {output_root}\n")
 
     runner = MatrixRunner(
@@ -666,6 +715,9 @@ def _experiment_command(args: argparse.Namespace) -> int:
         arms=arms,
         experiment_id=args.experiment_id,
         label=args.label,
+        repetitions=args.repeat,
+        jobs=args.jobs,
+        on_result=None if args.json else _print_progress,
     )
 
     # Group by arm_id (not the raw "<tool>+<context>" key group_results()
@@ -888,19 +940,22 @@ def _analyze_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _brief_args(args: dict) -> str:
-    """Short one-line view of tool arguments for progress output."""
-    for key in ("path", "command", "pattern"):
-        if isinstance(args.get(key), str):
-            value = args[key].replace("\n", " ")
-            return value if len(value) <= 70 else value[:67] + "..."
-    return ""
+def _print_progress(result, done: int, total: int) -> None:
+    """One line per finished task-arm run during experiment / bench."""
+    mark = "✓" if result.success else "✗"
+    rep = f" · rep{result.repetition}" if result.repetition else ""
+    tokens = result.resolved_total_tokens
+    tok = f"{tokens / 1000:.1f}k tokens" if tokens is not None else "tokens n/a"
+    secs = f"{result.duration_s:.0f}s" if result.duration_s is not None else ""
+    print(f"  [{done}/{total}] {mark} {result.task_id} · {result.arm_id}{rep} · {tok} · {secs}",
+          flush=True)
 
 
 def _chat_command(args: argparse.Namespace) -> int:
     import os
 
-    from forge.chat import ChatSession, run_repl
+    from forge.chat import ChatSession, TerminalApprover, TerminalOutput, run_repl
+    from forge.sessions import find_session
     from forge.config import load_settings
     from forge.llm import get_provider
     from forge.logging import setup_logging
@@ -924,14 +979,32 @@ def _chat_command(args: argparse.Namespace) -> int:
     except ImportError:
         pass
 
+    output = TerminalOutput()
+    stream = settings.stream and not args.no_stream
     session = ChatSession(
         settings=settings,
         mode=args.mode,
         provider=provider,
         write_trace=not args.no_trace,
-        on_tool_call=lambda name, a: print(f"  · {name} {_brief_args(a)}"),
+        on_tool_call=output.tool,
+        on_text=output.text if stream else None,
+        approve=TerminalApprover(before_prompt=output.end_reply),
+        approval_on=args.approve or settings.approve,
+        save_sessions=True,
     )
-    return run_repl(session)
+    if args.resume:
+        try:
+            path = find_session(settings.log_dir, args.resume, workspace=session.workspace)
+            if path is None:
+                where = "for this workspace" if args.resume == "latest" else f"'{args.resume}'"
+                print(f"error: no saved session {where}. Start one with: forge chat",
+                      file=sys.stderr)
+                return 2
+            session.resume(path)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    return run_repl(session, output=output)
 
 
 def _report_command(args: argparse.Namespace) -> int:

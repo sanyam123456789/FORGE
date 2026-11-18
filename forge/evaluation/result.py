@@ -97,6 +97,9 @@ class EvalResult:
     turns: int | None = None
     reasoning_tokens: int | None = None
     cached_input_tokens: int | None = None
+    # Largest input of a single LLM call in the run (provider-reported):
+    # how big the context got, which context management is meant to bound.
+    peak_input_tokens: int | None = None
 
     # context consumption — CHARACTER PROXY, not a tokenizer count.
     context_messages: int | None = None
@@ -114,6 +117,8 @@ class EvalResult:
     # knows nothing about "experiments" or "arms".
     experiment_id: str | None = None
     arm_id: str | None = None
+    # 1-based repetition number when a matrix runs each task-arm several times.
+    repetition: int | None = None
     task_category: str | None = None
     exposed_tools: list[str] | None = None
 

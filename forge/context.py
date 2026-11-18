@@ -750,6 +750,14 @@ class StableContextStrategy(ContextStrategy):
     ``prepare()`` calls always produce the same requests. A strategy object
     holds per-conversation state; it resets itself automatically when it is
     handed a different conversation.
+
+    Default budget (Step 12): compaction starts at 64k estimated tokens. On
+    the long-task benchmark, compacting at 16k made the model re-read files
+    it had already seen (21 reads instead of 10 on one task): total tokens
+    did not drop and uncached input rose by about 60%. Below the threshold
+    the requests are exactly those of the raw strategy, so the cache is
+    fully used; the threshold is a safety net for very long conversations,
+    not a token saver.
     """
 
     name = "stable"
@@ -757,8 +765,8 @@ class StableContextStrategy(ContextStrategy):
     def __init__(
         self,
         *,
-        compact_at_tokens: int = 16_000,
-        target_tokens: int = 8_000,
+        compact_at_tokens: int = 64_000,
+        target_tokens: int = 32_000,
         keep_recent_turns: int = 3,
         min_growth_tokens: int | None = None,
     ) -> None:

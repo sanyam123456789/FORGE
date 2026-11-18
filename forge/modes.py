@@ -5,8 +5,16 @@ Each mode is one (tool exposure, context strategy) pair:
 
     baseline      all tools, full history every turn            fixed + raw
     lean-tools    only the tools the task needs                 adaptive + raw
-    lean-context  managed (pruned/compressed) history           fixed + managed
-    smart         lean tools + cache-friendly managed context   adaptive + stable
+    lean-context  cache-friendly history, compacted only when   fixed + stable
+                  it gets very large
+    smart         lean tools + cache-friendly history           adaptive + stable
+
+Step 12: ``lean-context`` used the Step 6 ``managed`` strategy. On the
+long-task benchmark that strategy re-compressed file contents every turn,
+the model kept re-reading them, and it solved only 5 of 12 tasks (every
+other strategy solved 12 of 12). ``managed`` remains available as a
+research arm (``forge bench``, ``forge evaluate --context-strategy
+managed``) but no mode uses it.
 
 ``smart`` is FORGE's full approach and the default for ``forge`` / ``forge
 chat``. The research names (fixed/adaptive, raw/managed/stable) still work
@@ -39,8 +47,10 @@ MODES: dict[str, Mode] = {
     for m in (
         Mode("baseline", "fixed", "raw", "all tools, full history every turn"),
         Mode("lean-tools", "adaptive", "raw", "only the tools the task needs"),
-        Mode("lean-context", "fixed", "managed", "pruned and compressed history"),
-        Mode("smart", "adaptive", "stable", "lean tools + cache-friendly managed context"),
+        Mode("lean-context", "fixed", "stable",
+             "all tools, history compacted only when it gets very large"),
+        Mode("smart", "adaptive", "stable",
+             "only the tools the task needs + history compacted only when very large"),
     )
 }
 

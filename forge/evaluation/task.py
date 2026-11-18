@@ -15,9 +15,15 @@ results stay comparable.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+
+#: Seconds a task's verify script may run.
+VERIFY_TIMEOUT_S = 120
 
 
 def _is_safe_relative_path(path: str) -> bool:
@@ -183,6 +189,11 @@ class EvalTask:
     metadata:
         Free-form, non-identifying annotations (category, difficulty, ...).
         Recorded with results but never used for control or comparison keys.
+    verify_script:
+        Optional Python source of a hidden test, run after the agent
+        finishes as ``python -I <script> <workspace>``. It is never placed in
+        the workspace, so the agent cannot see or edit it. Exit code 0 means
+        the task's behaviour is correct. Counts as one check.
     """
 
     task_id: str
@@ -190,6 +201,7 @@ class EvalTask:
     checks: tuple[ArtifactCheck, ...] = ()
     fixtures: tuple[FixtureFile, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    verify_script: str | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id or not self.task_id.strip():
@@ -225,12 +237,14 @@ class EvalTask:
         return written
 
     def run_checks(self, workspace: str | Path) -> CheckOutcome:
-        """Evaluate every ``ArtifactCheck`` against *workspace*."""
-        if not self.checks:
+        """Evaluate every ``ArtifactCheck`` (and the verify script) against *workspace*."""
+        if not self.checks and not self.verify_script:
             return CheckOutcome(passed=None, details=(), checks_run=0)
 
         ws = Path(workspace)
         results = [check.evaluate(ws) for check in self.checks]
+        if self.verify_script:
+            results.append(run_verify_script(self.verify_script, ws))
         details = tuple(detail for _, detail in results)
         return CheckOutcome(
             passed=all(ok for ok, _ in results),
@@ -241,13 +255,16 @@ class EvalTask:
     # -- serialisation ---------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "task_id": self.task_id,
             "prompt": self.prompt,
             "checks": [c.to_dict() for c in self.checks],
             "fixtures": [f.to_dict() for f in self.fixtures],
             "metadata": dict(self.metadata),
         }
+        if self.verify_script:
+            data["verify_script"] = self.verify_script
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "EvalTask":
@@ -265,4 +282,38 @@ class EvalTask:
             ),
             fixtures=tuple(FixtureFile.from_dict(f) for f in raw_fixtures),
             metadata=dict(data.get("metadata", {}) or {}),
+            verify_script=data.get("verify_script") or None,
         )
+
+
+def run_verify_script(source: str, workspace: Path) -> tuple[bool, str]:
+    """Run a hidden verify script against *workspace*: ``(passed, detail)``.
+
+    The script is written to a temporary folder outside the workspace and
+    run with ``python -I`` (isolated: no user site-packages, the current
+    folder is not importable) and the workspace path as its argument.
+    """
+    # Absolute: the script runs *inside* the workspace, so a relative path
+    # would be resolved twice.
+    workspace = Path(workspace).resolve()
+    with tempfile.TemporaryDirectory(prefix="forge_verify_") as tmp:
+        script = Path(tmp) / "verify_task.py"
+        script.write_text(source, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", str(script), str(workspace)],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=VERIFY_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"verify script: timed out after {VERIFY_TIMEOUT_S}s"
+        except OSError as exc:
+            return False, f"verify script: could not run ({exc})"
+    if proc.returncode == 0:
+        return True, "verify script: passed"
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-6:]
+    return False, "verify script: failed — " + " | ".join(tail)

@@ -16,7 +16,11 @@ The adapter:
   it can be echoed back on later requests (see ``_REASONING_KEY``),
 - raises ``forge.llm.LLMError`` for every API failure, ``retryable=True``
   only for transient errors (429, 408, 5xx, connection errors, timeouts),
-  after its own bounded exponential-backoff retry.
+  after its own bounded exponential-backoff retry,
+- streams the reply when ``complete(..., on_text=callback)`` is used: text
+  is handed to the callback as it arrives, and the returned ``LLMResponse``
+  is the same as without streaming (usage comes from the final chunk via
+  ``stream_options.include_usage``).
 
 The API key is sent only in the Authorization header. It is never logged,
 never included in an exception message and never shown in ``repr()``.
@@ -80,6 +84,13 @@ Transport = Callable[
     [str, Mapping[str, str], dict[str, Any], float],
     tuple[int, Mapping[str, str], Any],
 ]
+#: stream_transport(url, headers, payload, timeout) -> (status, headers, body).
+#: On success ``body`` is an iterable of decoded text lines (server-sent
+#: events); on an HTTP error it is the parsed error body, like ``Transport``.
+StreamTransport = Callable[
+    [str, Mapping[str, str], dict[str, Any], float],
+    tuple[int, Mapping[str, str], Any],
+]
 
 
 def urllib_transport(
@@ -105,8 +116,35 @@ def urllib_transport(
     return status, resp_headers, body
 
 
+def urllib_stream_transport(
+    url: str, headers: Mapping[str, str], payload: dict[str, Any], timeout: float
+) -> tuple[int, dict[str, str], Any]:
+    """Streaming transport: returns the SSE lines as a lazy iterator."""
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=dict(headers), method="POST")
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)  # noqa: S310
+    except urllib.error.HTTPError as exc:
+        resp_headers = dict(exc.headers.items()) if exc.headers else {}
+        text = (exc.read() or b"").decode("utf-8", errors="replace")
+        try:
+            body: Any = json.loads(text) if text else None
+        except ValueError:
+            body = text
+        return exc.code, resp_headers, body
+
+    def lines():
+        with response:
+            for raw in response:
+                yield raw.decode("utf-8", errors="replace").rstrip("\r\n")
+
+    return response.status, dict(response.headers.items()), lines()
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """LLM provider adapter for OpenAI-compatible chat-completions APIs."""
+
+    supports_streaming = True
 
     def __init__(
         self,
@@ -119,6 +157,7 @@ class OpenAICompatibleProvider(LLMProvider):
         provider_label: str = "openai_compatible",
         transport: Transport | None = None,
         api_key_env: str = "FORGE_LLM_API_KEY",
+        stream_transport: StreamTransport | None = None,
     ) -> None:
         self._base_url = (base_url or "").strip().rstrip("/")
         self._api_key = (api_key or "").strip()
@@ -127,6 +166,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self._retry_max = max(0, int(retry_max))
         self._label = provider_label
         self._transport: Transport = transport or urllib_transport
+        self._stream_transport: StreamTransport = (
+            stream_transport or urllib_stream_transport
+        )
         self._api_key_env = api_key_env
         # One id per provider instance = one id per conversation. A run builds
         # its own provider; `forge chat` keeps one for the whole session, so
@@ -186,6 +228,7 @@ class OpenAICompatibleProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        on_text: Callable[[str], None] | None = None,
     ) -> LLMResponse:
         self.preflight()
         url = f"{self._base_url}/chat/completions"
@@ -205,19 +248,33 @@ class OpenAICompatibleProvider(LLMProvider):
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
+        if on_text is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
         attempt = 0
         while True:
             retry_after: float | None = None
+            emitted = [False]  # did any text reach on_text in this attempt?
             try:
-                status, resp_headers, body = self._transport(
-                    url, headers, payload, self._timeout
-                )
+                if on_text is None:
+                    status, resp_headers, body = self._transport(
+                        url, headers, payload, self._timeout
+                    )
+                else:
+                    status, resp_headers, body = self._stream_transport(
+                        url, headers, payload, self._timeout
+                    )
+                    if 200 <= status < 300:
+                        body = self._collect_stream(body, on_text, emitted)
+            except LLMError:
+                raise
             except Exception as exc:  # noqa: BLE001 - connection errors / timeouts
                 error = LLMError(
                     f"{self._label} request failed: {type(exc).__name__}: "
                     f"{self._redact(str(exc))}",
-                    retryable=True,
+                    # A retry after text was shown would show it twice.
+                    retryable=not emitted[0],
                 )
             else:
                 if 200 <= status < 300:
@@ -242,6 +299,102 @@ class OpenAICompatibleProvider(LLMProvider):
                 self._retry_max,
             )
             time.sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def _collect_stream(
+        self,
+        lines: Any,
+        on_text: Callable[[str], None],
+        emitted: list[bool],
+    ) -> dict[str, Any]:
+        """Read server-sent events into one non-streaming response body.
+
+        Text deltas go to *on_text* as they arrive. Tool-call deltas are
+        joined by their ``index``. The result has the same shape as a
+        normal chat-completions response, so ``_to_llm_response`` reads it.
+        """
+        content: list[str] = []
+        reasoning: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        finish: str | None = None
+        usage: dict[str, Any] | None = None
+        model: str | None = None
+        for line in lines:
+            if not line.startswith("data:"):
+                continue  # comments, "event:" lines, keep-alives
+            data = line[5:].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                raise LLMError(
+                    f"{self._label}: stream error: "
+                    f"{self._redact(_error_detail(chunk))}",
+                    retryable=False,
+                )
+            model = chunk.get("model") or model
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                text = delta.get("content")
+                if isinstance(text, str) and text:
+                    content.append(text)
+                    emitted[0] = True
+                    on_text(text)
+                thought = delta.get(_REASONING_KEY)
+                if isinstance(thought, str) and thought:
+                    reasoning.append(thought)
+                for tc in delta.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    index = tc.get("index", len(calls))
+                    slot = calls.setdefault(
+                        index, {"id": None, "name": "", "arguments": ""}
+                    )
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+
+        message: dict[str, Any] = {"content": "".join(content)}
+        if reasoning:
+            message[_REASONING_KEY] = "".join(reasoning)
+        if calls:
+            message["tool_calls"] = [
+                {
+                    "id": slot["id"],
+                    "type": "function",
+                    "function": {"name": slot["name"], "arguments": slot["arguments"]},
+                }
+                for _, slot in sorted(calls.items())
+            ]
+        body: dict[str, Any] = {
+            "choices": [{"message": message, "finish_reason": finish or "stop"}],
+            "model": model,
+        }
+        if usage is not None:
+            body["usage"] = usage
+        return body
 
     # ------------------------------------------------------------------
     # Errors

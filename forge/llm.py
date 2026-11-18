@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,10 @@ class LLMProvider(ABC):
     FORGE's Message/ToolCall/LLMResponse types and the provider's native API.
     """
 
+    #: True when ``complete()`` accepts ``on_text`` and streams. The agent
+    #: only passes ``on_text`` to providers that set this.
+    supports_streaming: bool = False
+
     @abstractmethod
     def complete(
         self,
@@ -199,6 +203,7 @@ class LLMProvider(ABC):
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int | None = None,
         temperature: float = 0.0,
+        on_text: Callable[[str], None] | None = None,
     ) -> LLMResponse:
         """Send *messages* to the LLM and return a normalised response.
 
@@ -215,6 +220,11 @@ class LLMProvider(ABC):
             (the provider's own default applies).
         temperature:
             Sampling temperature (0.0 = deterministic/greedy).
+        on_text:
+            Optional callback for streaming: called with each piece of reply
+            text as it arrives. The returned response is the same either
+            way. Adapters without streaming may ignore it; the agent only
+            passes it when a caller asked for streaming.
 
         Returns
         -------

@@ -37,6 +37,14 @@ not confound strategy comparisons):
   limit is not treated as the final answer; the model is asked to continue.
 - **Workspace file list.** The first message lists the workspace's files
   (``FORGE_REPO_MAP``), which saves exploratory rounds.
+- **Project rules.** ``AGENTS.md`` / ``FORGE.md`` in the workspace root are
+  added to the system prompt once (``FORGE_PROJECT_RULES``), so they sit in
+  the cached prefix instead of being repeated in every task.
+
+Every tool call the model requests always gets an answer in the history,
+even when the run stops early (tool-call limit, Ctrl+C): unanswered calls
+get a short "not run" result. OpenAI-style APIs reject a conversation with
+unanswered tool calls, so this keeps a ``forge chat`` session usable.
 
 ``AgentRuntime`` can also continue an existing ``ConversationContext``
 (``context=``): that is how ``forge chat`` keeps one conversation across
@@ -48,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +81,15 @@ STATUS_MAX_TURNS = "max_turns_exceeded"
 STATUS_MAX_TOOL_CALLS = "max_tool_calls_exceeded"
 STATUS_PROVIDER_ERROR = "provider_error"
 STATUS_FAILED = "failed"
+STATUS_INTERRUPTED = "interrupted"
+
+#: Tools that change files or run commands; these need approval when an
+#: ``approve`` callback is set.
+APPROVAL_TOOLS = frozenset({"write_file", "edit_file", "run_shell"})
+#: Project rules files read from the workspace root, in this order.
+PROJECT_RULES_FILES = ("AGENTS.md", "FORGE.md")
+#: Project rules longer than this are cut (with a note).
+PROJECT_RULES_MAX_CHARS = 20_000
 
 #: Read-only tools whose identical repeated results are collapsed.
 _READ_ONLY_TOOLS = frozenset({"read_file", "list_directory", "search_files"})
@@ -144,6 +162,9 @@ class AgentConfig:
     repo_map:
         Prepend the workspace file list to the first task message.
         ``None`` falls back to ``settings.repo_map``.
+    project_rules:
+        Add ``AGENTS.md`` / ``FORGE.md`` from the workspace root to the system
+        prompt. ``None`` falls back to ``settings.project_rules``.
     """
 
     task: str
@@ -156,6 +177,7 @@ class AgentConfig:
     temperature: float | None = None
     max_output_tokens: int | None = None
     repo_map: bool | None = None
+    project_rules: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -181,6 +203,8 @@ class AgentRun:
     total_tokens: int | None = None
     cached_input_tokens: int | None = None
     reasoning_tokens: int | None = None
+    # Largest input_tokens of a single call (provider-reported).
+    peak_input_tokens: int | None = None
 
     # Context size proxies.
     context_messages: int = 0
@@ -199,6 +223,8 @@ class AgentRun:
     tools_enabled_on_request: int = 0
     stall_nudges: int = 0
     length_continuations: int = 0
+    actions_declined: int = 0
+    unanswered_calls_closed: int = 0
 
     # Last request's state, for `forge chat` (/context, /tools).
     last_context_report: ContextReport | None = None
@@ -226,6 +252,10 @@ class AgentRuntime:
     Pass ``context=`` to continue an existing conversation (``forge chat``):
     the task is then appended as a new user message instead of starting a
     fresh system-prompt + task context.
+
+    Ctrl+C (``KeyboardInterrupt``) during a run ends it with status
+    ``interrupted`` instead of propagating, so the trace, the counters and
+    the conversation are always left in a consistent state.
     """
 
     def __init__(
@@ -240,6 +270,8 @@ class AgentRuntime:
         log_dir: str | Path | None = None,
         context: ConversationContext | None = None,
         on_tool_call: Callable[[str, dict[str, Any]], None] | None = None,
+        on_text: Callable[[str], None] | None = None,
+        approve: Callable[[ToolCall], bool | str] | None = None,
     ) -> None:
         self.config = config
         self._provider = provider
@@ -250,6 +282,12 @@ class AgentRuntime:
         self._log_dir = Path(log_dir) if log_dir is not None else None
         self._context = context
         self._on_tool_call = on_tool_call
+        # on_text: receives reply text as it streams in (display only).
+        self._on_text = on_text
+        # approve: asked before write_file / edit_file / run_shell. Returns
+        # True to run, False to decline, or a string = declined with a
+        # message from the user that is passed to the model.
+        self._approve = approve
         self._enabled_count = 0
 
     # ------------------------------------------------------------------
@@ -299,7 +337,12 @@ class AgentRuntime:
             ctx.add_message(Message(role="user", content=cfg.task))
         else:
             ctx = self._context if self._context is not None else ConversationContext()
-            ctx.add_message(Message(role="system", content=system_prompt))
+            ctx.add_message(
+                Message(
+                    role="system",
+                    content=self._system_message(cfg, system_prompt, workspace),
+                )
+            )
             ctx.add_message(
                 Message(role="user", content=self._first_message(cfg, workspace))
             )
@@ -322,7 +365,8 @@ class AgentRuntime:
 
         tool_calls_made = 0
         enabled_extra: list[str] = []  # hidden tools the model asked for
-        read_results: dict[str, tuple[int, str]] = {}  # call key -> (turn, digest)
+        # call key -> (turn, digest of the full result, tool_call_id)
+        read_results: dict[str, tuple[int, str, str]] = {}
         collapsed_keys: set[str] = set()
         failures: dict[str, int] = {}
         seen_outputs: set[str] = set()
@@ -381,11 +425,20 @@ class AgentRuntime:
 
                 try:
                     t0 = time.monotonic()
+                    # on_text is only passed when set, so providers without
+                    # streaming support keep working unchanged.
+                    stream_kw = (
+                        {"on_text": self._on_text}
+                        if self._on_text is not None
+                        and getattr(provider, "supports_streaming", False)
+                        else {}
+                    )
                     response = provider.complete(
                         prepared,
                         tools=schemas or None,
                         max_tokens=max_output_tokens,
                         temperature=temperature,
+                        **stream_kw,
                     )
                     latency_ms = (time.monotonic() - t0) * 1000
                 except (LLMError, ValueError) as exc:
@@ -406,6 +459,10 @@ class AgentRuntime:
                 )
                 run.llm_calls += 1
                 run.input_tokens = _add(run.input_tokens, response.input_tokens)
+                if response.input_tokens is not None:
+                    run.peak_input_tokens = max(
+                        run.peak_input_tokens or 0, response.input_tokens
+                    )
                 run.output_tokens = _add(run.output_tokens, response.output_tokens)
                 run.total_tokens = _add(run.total_tokens, response.total_tokens)
                 run.cached_input_tokens = _add(
@@ -485,7 +542,12 @@ class AgentRuntime:
                                 f"Available tools: {', '.join(exposed_names)}"
                             )
                     else:
-                        result = self._dispatch_tool(registry, call)
+                        declined = self._ask_approval(call)
+                        if declined is not None:
+                            run.actions_declined += 1
+                            result = declined
+                        else:
+                            result = self._dispatch_tool(registry, call)
 
                     output = result.output
                     key = _call_key(call)
@@ -506,6 +568,13 @@ class AgentRuntime:
                             earlier is not None
                             and earlier[1] == digest
                             and key not in collapsed_keys
+                            # Only point back to a result the model can still
+                            # see in full: a context strategy may have
+                            # compressed or dropped it since.
+                            and (
+                                earlier[0] == turn
+                                or (earlier[2], digest) in _visible_results(prepared)
+                            )
                         ):
                             collapsed_keys.add(key)
                             run.duplicate_reads_collapsed += 1
@@ -517,7 +586,7 @@ class AgentRuntime:
                             metadata[DUPLICATE_RESULT_FLAG] = True
                             result.metadata["duplicate_of_turn"] = earlier[0]
                         else:
-                            read_results[key] = (turn, digest)
+                            read_results[key] = (turn, digest, call.id)
                     elif not result.success and key:
                         failures[key] = failures.get(key, 0) + 1
                         if failures[key] == _REPEATED_FAILURE_LIMIT:
@@ -557,11 +626,16 @@ class AgentRuntime:
                     run.length_continuations += 1
                     ctx.add_message(Message(role="user", content=_CUT_OFF_NOTE))
 
+        except KeyboardInterrupt:
+            run.status = STATUS_INTERRUPTED
+            run.error = "interrupted by the user"
+            tracer.record_error(run.error)
         except Exception as exc:  # noqa: BLE001 - the loop must always finish cleanly
             run.status = STATUS_FAILED
             run.error = f"{type(exc).__name__}: {exc}"
             tracer.record_error(run.error)
         finally:
+            run.unanswered_calls_closed = _close_unanswered_calls(ctx, run.status)
             run.tools_enabled_on_request = self._enabled_count
             run.context_messages = ctx.message_count
             run.context_char_count = ctx.approximate_char_count
@@ -598,6 +672,31 @@ class AgentRuntime:
             output=f"Enabled {name}. It is offered from your next step on.",
             metadata={"enabled": name},
         )
+
+    def _ask_approval(self, call: ToolCall) -> ToolResult | None:
+        """None = go ahead; otherwise the "declined" result for the model."""
+        if self._approve is None or call.name not in APPROVAL_TOOLS:
+            return None
+        decision = self._approve(call)
+        if decision is True:
+            return None
+        message = f"The user declined this {call.name} call, so it was not run."
+        if isinstance(decision, str) and decision.strip():
+            message += f" The user said: {decision.strip()}"
+        else:
+            message += " Do not retry it unchanged; take another approach or ask the user."
+        return ToolResult.from_error(message)
+
+    @staticmethod
+    def _system_message(cfg: AgentConfig, system_prompt: str, workspace: Path) -> str:
+        use_rules = (
+            cfg.project_rules if cfg.project_rules is not None
+            else getattr(settings, "project_rules", True)
+        )
+        if not use_rules:
+            return system_prompt
+        rules = load_project_rules(workspace)
+        return f"{system_prompt}\n\n{rules}" if rules else system_prompt
 
     @staticmethod
     def _first_message(cfg: AgentConfig, workspace: Path) -> str:
@@ -646,7 +745,81 @@ class AgentRuntime:
 
 
 def _new_run_id() -> str:
-    return "run_" + datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+    # The random suffix keeps ids unique when runs start in parallel.
+    stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+    return f"run_{stamp}_{uuid.uuid4().hex[:6]}"
+
+
+def load_project_rules(workspace: Path) -> str:
+    """Project rules text from AGENTS.md / FORGE.md in *workspace*, or ''."""
+    parts: list[str] = []
+    for name in PROJECT_RULES_FILES:
+        path = Path(workspace) / name
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        if len(text) > PROJECT_RULES_MAX_CHARS:
+            text = (
+                text[:PROJECT_RULES_MAX_CHARS]
+                + f"\n[... {name} cut at {PROJECT_RULES_MAX_CHARS} characters]"
+            )
+        parts.append(
+            f"# Project instructions (from {name}; included here in full, "
+            f"no need to read the file)\n{text}"
+        )
+    return "\n\n".join(parts)
+
+
+def _close_unanswered_calls(ctx: ConversationContext, status: str) -> int:
+    """Give every unanswered tool call in the last assistant turn a result.
+
+    A run can stop between an assistant message that requested tools and
+    the results of those tools (tool-call limit reached mid-batch, Ctrl+C
+    while a tool runs). Returns how many "not run" results were added.
+    """
+    messages = ctx.messages
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.role == "user":
+            return 0
+        if msg.role != "assistant":
+            continue
+        if not msg.tool_calls:
+            return 0
+        answered = {m.tool_call_id for m in messages[idx + 1:] if m.role == "tool"}
+        reason = {
+            STATUS_INTERRUPTED: "the user interrupted the run",
+            STATUS_MAX_TOOL_CALLS: "the tool-call limit was reached",
+        }.get(status, "the run stopped first")
+        added = 0
+        for call in msg.tool_calls:
+            if call.id in answered:
+                continue
+            ctx.add_message(
+                Message(
+                    role="tool",
+                    content=f"[FORGE: not run — {reason}.]",
+                    tool_call_id=call.id,
+                    name=call.name,
+                )
+            )
+            added += 1
+        return added
+    return 0
+
+
+def _visible_results(prepared: list[Message]) -> set[tuple[str | None, str]]:
+    """(tool_call_id, digest) of every tool result sent in full this turn."""
+    return {
+        (m.tool_call_id, hashlib.sha256(m.content.encode("utf-8")).hexdigest())
+        for m in prepared
+        if m.role == "tool"
+    }
 
 
 def _safe_args(call: ToolCall) -> dict[str, Any]:

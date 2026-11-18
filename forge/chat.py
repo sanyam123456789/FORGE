@@ -14,12 +14,18 @@ is a slash command:
     /compact            compact the context on the next request
     /diff [all]         file changes from the last task (or the whole session)
     /undo               revert the file changes of the last task
+    /approve [on|off]   ask before file edits and shell commands
+    /sessions           saved conversations for this workspace
     /clear              start a fresh conversation
     /workspace [path]   show or change the folder FORGE works in
     /exit               quit
 
 One provider object is kept for the whole conversation, so every request
 carries the same session id — OpenCode Go uses it for prompt caching.
+
+The conversation is saved after every task (``forge.sessions``), so
+``forge chat --resume`` can continue it later. Reply text streams to the
+terminal as it arrives.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,9 +42,19 @@ from typing import Any
 from forge.agent import AgentConfig, AgentRun, AgentRuntime
 from forge.builtin_tools import SEARCH_SKIP_DIRS, build_default_registry
 from forge.context import ConversationContext, StableContextStrategy
-from forge.llm import LLMProvider, get_provider
+from forge.llm import LLMProvider, ToolCall, get_provider
 from forge.modes import DEFAULT_MODE, MODES, Mode, build_strategies, get_mode
+from forge.sessions import (
+    list_sessions,
+    load_session,
+    new_session_id,
+    save_session,
+    sessions_dir,
+)
+from forge.logging import get_logger
 from forge.tokens import estimate_messages_tokens
+
+logger = get_logger(__name__)
 
 # Workspace snapshots (for /diff and /undo) skip big or numerous files.
 _SNAPSHOT_MAX_FILE_BYTES = 2_000_000
@@ -170,6 +187,10 @@ class ChatSession:
         provider: LLMProvider | None = None,
         write_trace: bool = True,
         on_tool_call: Callable[[str, dict[str, Any]], None] | None = None,
+        on_text: Callable[[str], None] | None = None,
+        approve: Callable[[ToolCall], bool | str] | None = None,
+        approval_on: bool = False,
+        save_sessions: bool = False,
     ) -> None:
         self.settings = settings
         self.workspace = Path(workspace or settings.workspace_root).resolve()
@@ -177,11 +198,17 @@ class ChatSession:
         self._provider = provider
         self._write_trace = write_trace
         self._on_tool_call = on_tool_call
+        self._on_text = on_text
+        # approve: asked before file edits / shell commands while approval_on.
+        self.approve = approve
+        self.approval_on = approval_on and approve is not None
+        self.save_sessions = save_sessions
         self.totals = _Totals()
         self.last_run: AgentRun | None = None
         self._history: list[tuple[Snapshot, Snapshot]] = []  # (before, after) per task
         self._session_start: Snapshot | None = None
         self._pending_note: str | None = None
+        self.session_id = new_session_id()
         self._reset_conversation()
 
     # -- state -------------------------------------------------------------
@@ -202,8 +229,64 @@ class ChatSession:
         self.tool_exposure, self.context_strategy = build_strategies(self.mode)
         self._history.clear()
         self._session_start = None
+        self.totals = _Totals()
+        self.last_run = None
+        self._pending_note = None
+        self.session_id = new_session_id()
         if self._provider is not None and hasattr(self._provider, "new_session"):
             self._provider.new_session()
+
+    # -- saving and resuming -----------------------------------------------
+
+    @property
+    def session_path(self) -> Path:
+        return sessions_dir(self.settings.log_dir) / f"{self.session_id}.json"
+
+    def save(self) -> Path | None:
+        """Write the conversation to its session file (if saving is on)."""
+        if not self.save_sessions or not self.context.message_count:
+            return None
+        try:
+            return save_session(
+                self.session_path,
+                {
+                    "session_id": self.session_id,
+                    "workspace": str(self.workspace),
+                    "mode": self.mode.name,
+                    "model": self.model,
+                    "totals": dataclasses.asdict(self.totals),
+                    "pending_note": self._pending_note,
+                },
+                self.context.get_messages(),
+            )
+        except OSError as exc:  # saving must never break the conversation
+            logger.warning("could not save the chat session: %s", exc)
+            return None
+
+    def resume(self, path: str | Path) -> dict[str, Any]:
+        """Load a saved session into this one. Returns the saved fields."""
+        fields, messages = load_session(path)
+        workspace = Path(fields.get("workspace") or self.workspace)
+        if not workspace.is_dir():
+            raise ValueError(f"the session's workspace no longer exists: {workspace}")
+        self.workspace = workspace.resolve()
+        mode = fields.get("mode")
+        if mode in MODES:
+            self.mode = get_mode(mode)
+        self._reset_conversation()
+        self.session_id = str(fields.get("session_id") or Path(path).stem)
+        for message in messages:
+            self.context.add_message(message)
+        totals = fields.get("totals")
+        if isinstance(totals, dict):
+            known = {f.name for f in dataclasses.fields(_Totals)}
+            self.totals = _Totals(**{k: v for k, v in totals.items() if k in known})
+        note = fields.get("pending_note")
+        self._pending_note = note if isinstance(note, str) and note else None
+        return fields
+
+    def saved_sessions(self) -> list[dict[str, Any]]:
+        return list_sessions(self.settings.log_dir, workspace=self.workspace)
 
     def _snapshot(self) -> Snapshot | None:
         return snapshot_workspace(self.workspace, exclude=(Path(self.settings.log_dir),))
@@ -233,16 +316,25 @@ class ChatSession:
             log_dir=self.settings.log_dir,
             context=self.context,
             on_tool_call=self._on_tool_call,
+            on_text=self._on_text,
+            approve=self.approve if self.approval_on else None,
         )
-        run = runtime.run()
-        self.last_run = run
-        self.totals.add(run)
+        run: AgentRun | None = None
         changes = FileChanges()
-        after = self._snapshot()
-        if before is not None and after is not None:
-            changes = compare_snapshots(before, after)
-            if changes.any:
-                self._history.append((before, after))
+        try:
+            run = runtime.run()  # Ctrl+C inside ends the run as "interrupted"
+        finally:
+            # Record file changes even if the run was cut short, so /diff
+            # and /undo always cover what the agent did.
+            after = self._snapshot()
+            if before is not None and after is not None:
+                changes = compare_snapshots(before, after)
+                if changes.any:
+                    self._history.append((before, after))
+            if run is not None:
+                self.last_run = run
+                self.totals.add(run)
+            self.save()
         return run, changes
 
     # -- slash-command actions ---------------------------------------------
@@ -304,6 +396,7 @@ class ChatSession:
             "[Note from the user: your previous file changes were undone "
             f"({changes.summary()}). The files are back to their earlier state.]"
         )
+        self.save()
         return changes
 
     def context_stats(self) -> dict[str, Any]:
@@ -336,9 +429,138 @@ Type a task in plain words. Slash commands:
   /compact            compact the context on the next request (smart mode)
   /diff [all]         file changes from the last task (or the whole session)
   /undo               revert the file changes of the last task
+  /approve [on|off]   ask before file edits and shell commands
+  /sessions           saved conversations for this workspace
   /clear              start a fresh conversation
   /workspace [path]   show or change the folder FORGE works in
-  /exit               quit"""
+  /exit               quit
+Ctrl+C stops the current task; the conversation stays usable."""
+
+
+def brief_args(args: dict) -> str:
+    """Short one-line view of tool arguments for progress output."""
+    for key in ("path", "command", "pattern", "name"):
+        if isinstance(args.get(key), str):
+            value = args[key].replace("\n", " ")
+            return value if len(value) <= 70 else value[:67] + "..."
+    return ""
+
+
+class TerminalOutput:
+    """Prints streamed reply text and tool-progress lines without mixing them.
+
+    ``text`` receives streamed chunks; ``tool`` prints a progress line on a
+    line of its own. ``streamed`` says whether any reply text was shown
+    since the last ``reset`` (then the final answer is already on screen).
+    """
+
+    def __init__(self, write: Callable[[str], None] | None = None) -> None:
+        self._write = write or _stdout_write
+        self.at_line_start = True
+        self.streamed = False
+
+    def reset(self) -> None:
+        self.streamed = False
+
+    def text(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self._write(chunk)
+        self.at_line_start = chunk.endswith("\n")
+        self.streamed = True
+
+    def line(self, text: str) -> None:
+        if not self.at_line_start:
+            self._write("\n")
+        self._write(text + "\n")
+        self.at_line_start = True
+
+    def tool(self, name: str, args: dict[str, Any]) -> None:
+        self.line(f"  · {name} {brief_args(args)}".rstrip())
+
+    def end_reply(self) -> None:
+        if not self.at_line_start:
+            self._write("\n")
+            self.at_line_start = True
+
+
+def _stdout_write(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+_PREVIEW_LINES = 20
+
+
+def describe_action(call: ToolCall) -> str:
+    """What an approval prompt shows for a write_file / edit_file / run_shell call."""
+    args = call.arguments if isinstance(call.arguments, dict) else {}
+    if call.name == "run_shell":
+        return f"  ? run_shell: {args.get('command', '')}"
+    if call.name == "edit_file":
+        old = str(args.get("old_string", "")).splitlines()
+        new = str(args.get("new_string", "")).splitlines()
+        lines = [f"  ? edit_file {args.get('path', '')}"]
+        diff = [d for d in difflib.unified_diff(old, new, lineterm="", n=1)][2:]
+        for d in diff[:_PREVIEW_LINES]:
+            lines.append(f"    {d}")
+        if len(diff) > _PREVIEW_LINES:
+            lines.append(f"    ... {len(diff) - _PREVIEW_LINES} more lines")
+        return "\n".join(lines)
+    if call.name == "write_file":
+        content = str(args.get("content", "")).splitlines()
+        verb = "overwrite" if args.get("overwrite") else "create"
+        lines = [f"  ? write_file ({verb}) {args.get('path', '')} — {len(content)} lines"]
+        for d in content[:_PREVIEW_LINES]:
+            lines.append(f"    + {d}")
+        if len(content) > _PREVIEW_LINES:
+            lines.append(f"    ... {len(content) - _PREVIEW_LINES} more lines")
+        return "\n".join(lines)
+    return f"  ? {call.name} {brief_args(args)}"
+
+
+class TerminalApprover:
+    """Asks in the terminal before file edits and shell commands.
+
+    Answers: y = run it, n = don't, a = always allow this tool for the rest
+    of the session, anything else = don't, and pass the text to the model
+    as the user's instruction. Enter alone counts as "no".
+    """
+
+    PROMPT = "  allow? [y]es / [n]o / [a]lways for this tool / or say what to do instead: "
+
+    def __init__(
+        self,
+        *,
+        input_fn: Callable[[str], str] | None = None,
+        out: Callable[[str], None] | None = None,
+        before_prompt: Callable[[], None] | None = None,
+    ) -> None:
+        # Looked up at call time, so a replaced builtins.input/print is used.
+        self._input = input_fn or (lambda prompt: input(prompt))
+        self._out = out or (lambda text: print(text))
+        self._before_prompt = before_prompt
+        self.always: set[str] = set()
+
+    def __call__(self, call: ToolCall) -> bool | str:
+        if call.name in self.always:
+            return True
+        if self._before_prompt is not None:
+            self._before_prompt()
+        self._out(describe_action(call))
+        try:
+            answer = self._input(self.PROMPT).strip()
+        except EOFError:
+            return False
+        low = answer.lower()
+        if low in ("y", "yes"):
+            return True
+        if low in ("a", "always"):
+            self.always.add(call.name)
+            return True
+        if low in ("", "n", "no"):
+            return False
+        return answer
 
 
 def format_tokens(n: int | None) -> str:
@@ -425,6 +647,26 @@ def handle_command(session: ChatSession, line: str, out: Callable[[str], None]) 
     elif name == "undo":
         changes = session.undo()
         out(f"undone: {changes.summary()}" if changes else "nothing to undo")
+    elif name == "approve":
+        if arg in ("on", "off"):
+            if arg == "on" and session.approve is None:
+                out("approval prompts are not available here")
+            else:
+                session.approval_on = arg == "on"
+        elif arg:
+            out("usage: /approve [on|off]")
+        out(f"approval before edits and commands: {'on' if session.approval_on else 'off'}")
+    elif name == "sessions":
+        saved = session.saved_sessions()
+        if not saved:
+            out("no saved sessions for this workspace")
+        for entry in saved[:10]:
+            mark = "*" if entry["session_id"] == session.session_id else " "
+            tasks = entry["tasks"] if entry["tasks"] is not None else "?"
+            out(f" {mark} {entry['session_id']}  {entry['updated_at'][:16].replace('T', ' ')}"
+                f"  {tasks} task(s)  {entry['title']}")
+        if saved:
+            out("resume one with: forge chat --resume <id>")
     elif name == "clear":
         session.clear()
         out("started a fresh conversation")
@@ -447,9 +689,14 @@ def run_repl(
     *,
     input_fn: Callable[[str], str] = input,
     out: Callable[[str], None] = print,
+    output: TerminalOutput | None = None,
 ) -> int:
     out(f"FORGE chat · {session.model} · mode: {session.mode.name}")
     out(f"workspace: {session.workspace}")
+    if session.context.message_count:
+        out(f"resumed session {session.session_id} ({session.totals.tasks} earlier task(s))")
+    if session.approval_on:
+        out("approval before edits and commands: on (/approve off to stop asking)")
     out("Type a task, or /help for commands.\n")
     while True:
         try:
@@ -463,13 +710,20 @@ def run_repl(
             if not handle_command(session, line, out):
                 return 0
             continue
+        if output is not None:
+            output.reset()
         try:
             run, changes = session.send(line)
         except KeyboardInterrupt:
             out("\n(interrupted)")
             continue
+        if output is not None:
+            output.end_reply()
         out("")
-        out(run.final_answer.strip() if run.final_answer else f"(no answer: {run.error or run.status})")
+        if not (output is not None and output.streamed and run.final_answer):
+            out(run.final_answer.strip() if run.final_answer
+                else f"(no answer: {run.error or run.status})")
+            out("")
         if changes.any:
             out(f"files: {changes.summary()}  (/diff to view, /undo to revert)")
         out(result_line(run))

@@ -96,6 +96,14 @@ class ForgeSettings:
     # Prepend a compact list of workspace files to the task (FORGE_REPO_MAP),
     # so the agent does not spend turns exploring with list_directory.
     repo_map: bool = field(default=True)
+    # Add AGENTS.md / FORGE.md from the workspace root to the system prompt
+    # (FORGE_PROJECT_RULES).
+    project_rules: bool = field(default=True)
+    # Ask before write_file / edit_file / run_shell in run and chat
+    # (FORGE_APPROVE).
+    approve: bool = field(default=False)
+    # Stream reply text to the terminal in run and chat (FORGE_STREAM).
+    stream: bool = field(default=True)
 
     def __repr__(self) -> str:  # pragma: no cover
         """Redact secret fields from string representation."""
@@ -295,6 +303,9 @@ def load_settings() -> ForgeSettings:
         log_dir=_get_path("FORGE_LOG_DIR", Path("logs")),
         shell_env_allow=_get_list("FORGE_SHELL_ENV_ALLOW"),
         repo_map=_get_bool("FORGE_REPO_MAP", True),
+        project_rules=_get_bool("FORGE_PROJECT_RULES", True),
+        approve=_get_bool("FORGE_APPROVE", False),
+        stream=_get_bool("FORGE_STREAM", True),
     )
 
 

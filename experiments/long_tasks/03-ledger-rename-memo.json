@@ -1,0 +1,11 @@
+{
+  "task_id": "ledger-rename-memo",
+  "prompt": "Rename the Transaction field `memo` to `description` throughout this ledger project: the dataclass in ledger/models.py and every use of it in the ledger package and in the tests. Ledger JSON files must now store the text under the key \"description\", but load_ledger must still read older files that use \"memo\". CSV imports must keep accepting a \"memo\" column header (as well as \"description\"). Run the test suite (`python -m unittest discover -s tests`) at the end and make sure it passes.",
+  "fixtures": { "dir": "fixtures/ledger" },
+  "verify": "verify/ledger-rename-memo.py",
+  "metadata": {
+    "category": "refactor",
+    "difficulty": "long",
+    "summary": "Rename a field used across seven files, with backward-compatible loading. Hidden check: new field name, old files still load, CSV headers, rules, CLI, no .memo left, suite passes."
+  }
+}

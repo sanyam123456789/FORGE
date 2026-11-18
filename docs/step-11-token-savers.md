@@ -74,7 +74,7 @@ forge report                       # readable table of the newest results
 ```
 
 Modes (`--mode`, `/mode`): `baseline` (fixed + raw), `lean-tools`
-(adaptive + raw), `lean-context` (fixed + managed), `smart` (adaptive +
+(adaptive + raw), `lean-context` (fixed + managed; fixed + stable since Step 12), `smart` (adaptive +
 stable, the default).
 
 Chat commands: `/help /mode /model /tokens /context /tools /compact /diff
