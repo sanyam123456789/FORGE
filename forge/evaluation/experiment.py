@@ -23,7 +23,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from forge.context import ContextStrategy, ManagedContextStrategy, RawContextStrategy
+from forge.context import (
+    ContextStrategy,
+    ManagedContextStrategy,
+    RawContextStrategy,
+    StableContextStrategy,
+)
 from forge.tools import AdaptiveToolExposure, FixedToolExposure, ToolExposureStrategy
 
 # --- Strategy identifiers -------------------------------------------------
@@ -33,13 +38,15 @@ TOOL_STRATEGY_ADAPTIVE = "adaptive"
 
 CONTEXT_STRATEGY_RAW = "raw"
 CONTEXT_STRATEGY_MANAGED = "managed"
+#: Step 11: managed rules applied in batches so prompt caching keeps working.
+CONTEXT_STRATEGY_STABLE = "stable"
 
 #: Strategies this step can actually execute.
 IMPLEMENTED_TOOL_STRATEGIES: frozenset[str] = frozenset(
     {TOOL_STRATEGY_FIXED, TOOL_STRATEGY_ADAPTIVE}
 )
 IMPLEMENTED_CONTEXT_STRATEGIES: frozenset[str] = frozenset(
-    {CONTEXT_STRATEGY_RAW, CONTEXT_STRATEGY_MANAGED}
+    {CONTEXT_STRATEGY_RAW, CONTEXT_STRATEGY_MANAGED, CONTEXT_STRATEGY_STABLE}
 )
 
 #: Strategies that are planned but NOT implemented — allowed as labels only.
@@ -144,11 +151,13 @@ class ExperimentConfig:
             if self.tool_strategy == TOOL_STRATEGY_ADAPTIVE
             else FixedToolExposure()
         )
-        context_strategy: ContextStrategy = (
-            ManagedContextStrategy()
-            if self.context_strategy == CONTEXT_STRATEGY_MANAGED
-            else RawContextStrategy()
-        )
+        context_strategy: ContextStrategy
+        if self.context_strategy == CONTEXT_STRATEGY_MANAGED:
+            context_strategy = ManagedContextStrategy()
+        elif self.context_strategy == CONTEXT_STRATEGY_STABLE:
+            context_strategy = StableContextStrategy()
+        else:
+            context_strategy = RawContextStrategy()
         return tool_exposure, context_strategy
 
     # -- serialisation ---------------------------------------------------

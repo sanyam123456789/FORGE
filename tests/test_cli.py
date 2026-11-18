@@ -81,7 +81,7 @@ def test_run_completes_and_creates_file(tmp_path, monkeypatch, capsys):
     assert (tmp_path / "add.py").read_text(encoding="utf-8").startswith("def add")
     out = capsys.readouterr().out
     assert "Created add.py" in out
-    assert "status: completed" in out
+    assert "✓ Done" in out
 
 
 def test_run_nonzero_exit_when_limit_hit(tmp_path, monkeypatch):

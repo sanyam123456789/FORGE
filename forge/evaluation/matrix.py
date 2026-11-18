@@ -39,6 +39,7 @@ from forge.builtin_tools import build_default_registry
 from forge.evaluation.experiment import (
     CONTEXT_STRATEGY_MANAGED,
     CONTEXT_STRATEGY_RAW,
+    CONTEXT_STRATEGY_STABLE,
     TOOL_STRATEGY_ADAPTIVE,
     TOOL_STRATEGY_FIXED,
     ExperimentConfig,
@@ -64,6 +65,9 @@ ARM_FIXED_RAW = "fixed_raw"
 ARM_FIXED_MANAGED = "fixed_managed"
 ARM_ADAPTIVE_RAW = "adaptive_raw"
 ARM_ADAPTIVE_MANAGED = "adaptive_managed"
+#: Step 11 arms (cache-friendly "stable" context). Not part of the 2x2.
+ARM_FIXED_STABLE = "fixed_stable"
+ARM_ADAPTIVE_STABLE = "adaptive_stable"
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,16 @@ ARMS: tuple[ExperimentArm, ...] = (
 
 ARMS_BY_ID: dict[str, ExperimentArm] = {a.arm_id: a for a in ARMS}
 
+#: Extra arms outside the formal 2x2 (Step 11). ``forge bench`` runs them
+#: alongside the four 2x2 arms; ``forge experiment`` / ``analyze`` keep the
+#: 2x2 by default.
+EXTRA_ARMS: tuple[ExperimentArm, ...] = (
+    ExperimentArm(ARM_FIXED_STABLE, TOOL_STRATEGY_FIXED, CONTEXT_STRATEGY_STABLE),
+    ExperimentArm(ARM_ADAPTIVE_STABLE, TOOL_STRATEGY_ADAPTIVE, CONTEXT_STRATEGY_STABLE),
+)
+ALL_ARMS: tuple[ExperimentArm, ...] = ARMS + EXTRA_ARMS
+ALL_ARMS_BY_ID: dict[str, ExperimentArm] = {a.arm_id: a for a in ALL_ARMS}
+
 
 def arms_by_ids(arm_ids: Sequence[str]) -> tuple[ExperimentArm, ...]:
     """Resolve *arm_ids* to ``ExperimentArm``s, in the canonical ``ARMS`` order.
@@ -98,12 +112,12 @@ def arms_by_ids(arm_ids: Sequence[str]) -> tuple[ExperimentArm, ...]:
     input order. Raises ``ValueError`` naming any unrecognised id.
     """
     wanted = set(arm_ids)
-    unknown = wanted - set(ARMS_BY_ID)
+    unknown = wanted - set(ALL_ARMS_BY_ID)
     if unknown:
         raise ValueError(
-            f"unknown arm id(s) {sorted(unknown)}; known: {sorted(ARMS_BY_ID)}"
+            f"unknown arm id(s) {sorted(unknown)}; known: {sorted(ALL_ARMS_BY_ID)}"
         )
-    return tuple(a for a in ARMS if a.arm_id in wanted)
+    return tuple(a for a in ALL_ARMS if a.arm_id in wanted)
 
 
 # ---------------------------------------------------------------------------

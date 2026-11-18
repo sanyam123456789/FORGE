@@ -230,7 +230,7 @@ class TestAdaptiveToolExposureSelection:
         selected = strategy.select(
             builtin_registry, task="Fix the off-by-one bug in ranges.py."
         )
-        assert set(selected) == {"read_file", "edit_file", "list_directory"}
+        assert set(selected) == {"read_file", "edit_file", "list_directory", "search_files"}
         assert "write_file" not in selected
         assert "run_shell" not in selected
 

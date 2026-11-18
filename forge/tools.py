@@ -230,6 +230,10 @@ class ToolExposureStrategy(ABC):
     #: Stable identifier recorded in run traces.
     name: str = "abstract"
 
+    #: Whether the agent may turn on tools this strategy hid (``enable_tool``).
+    #: False for an explicitly pinned list, which is a deliberate restriction.
+    allows_growth: bool = True
+
     @abstractmethod
     def select(
         self,
@@ -249,6 +253,8 @@ class FixedToolExposure(ToolExposureStrategy):
     """
 
     name = "fixed"
+    #: A pinned list is a deliberate restriction: never grown on request.
+    allows_growth = False
 
     def __init__(self, pinned: list[str] | None = None) -> None:
         self.pinned = pinned
@@ -300,7 +306,7 @@ class AdaptiveToolExposure(ToolExposureStrategy):
       not narrowed) or, in principle, an unintended category.
     - The policy is static and does not learn from the run's actual tool
       usage or from prior runs.
-    - Only the five built-in tools are categorised; a newly added tool with
+    - Only the built-in tools are categorised; a newly added tool with
       no entry in ``CATEGORY_TOOLS`` is simply never offered by a matched
       category (it is still offered whenever the safe fallback applies).
     """
@@ -314,8 +320,8 @@ class AdaptiveToolExposure(ToolExposureStrategy):
         # A brand-new file: nothing to inspect or run yet, but read_file lets
         # the agent check the workspace state first if it chooses to.
         "create": ("read_file", "write_file", "list_directory"),
-        # An existing file needs to be read and changed in place.
-        "edit": ("read_file", "edit_file", "list_directory"),
+        # An existing file needs to be found, read and changed in place.
+        "edit": ("read_file", "edit_file", "list_directory", "search_files"),
         # The task explicitly involves running code (tests, scripts) and may
         # also need to create/modify files along the way.
         "test": (
@@ -323,6 +329,7 @@ class AdaptiveToolExposure(ToolExposureStrategy):
             "write_file",
             "edit_file",
             "list_directory",
+            "search_files",
             "run_shell",
         ),
     }
@@ -345,6 +352,14 @@ class AdaptiveToolExposure(ToolExposureStrategy):
                 "run 'python",
                 "confirm the tests",
                 "tests pass",
+                # Step 11: tasks that ask to run or check code by any wording.
+                "run a ",
+                "run python",
+                "python -c",
+                "one-liner",
+                "execute ",
+                "run it",
+                "run the script",
             ),
         ),
         (

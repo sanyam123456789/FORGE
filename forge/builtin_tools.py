@@ -1,13 +1,14 @@
 """
 forge.builtin_tools — the minimal built-in coding toolset.
 
-Five tools, each a small ``Tool`` subclass registered through the standard
+Six tools, each a small ``Tool`` subclass registered through the standard
 ``ToolRegistry``:
 
-    read_file       read a UTF-8 text file inside the workspace
+    read_file       read a UTF-8 text file (or a line range) inside the workspace
     write_file      create / overwrite a text file inside the workspace
     edit_file       replace an exact substring in an existing file
     list_directory  list the entries of a directory inside the workspace
+    search_files    find lines matching a regex across workspace files
     run_shell       run a non-interactive shell command inside the workspace
 
 Every tool:
@@ -136,6 +137,30 @@ def _split_lines(text: str) -> list[str]:
     if lines[-1]:
         out.append(lines[-1])
     return out
+
+
+def _read_keep_newlines(path: Path) -> tuple[str, str]:
+    """Return (text with LF line endings, the file's own line ending).
+
+    Raises UnicodeDecodeError for non-UTF-8 files.
+    """
+    raw = path.read_bytes().decode("utf-8")
+    newline = "\r\n" if "\r\n" in raw else "\n"
+    return raw.replace("\r\n", "\n"), newline
+
+
+def _write_with_newlines(path: Path, text: str, newline: str) -> int:
+    """Write *text* with *newline* line endings, byte-exact.
+
+    Path.write_text would translate every LF into CRLF on Windows, turning
+    an LF file into a CRLF file on the first edit. Returns bytes written.
+    """
+    text = text.replace("\r\n", "\n")
+    if newline != "\n":
+        text = text.replace("\n", newline)
+    data = text.encode("utf-8")
+    path.write_bytes(data)
+    return len(data)
 
 
 def _reject_unknown(kwargs: dict[str, Any], allowed: set[str]) -> None:
@@ -380,15 +405,23 @@ class WriteFileTool(_BuiltinTool):
         )
         existed = resolved.exists()
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        # Keep an existing file's line-ending style; new files get the
+        # content's own endings (LF unless the model wrote CRLF).
+        newline = "\r\n" if "\r\n" in content else "\n"
+        if existed and resolved.is_file():
+            try:
+                newline = _read_keep_newlines(resolved)[1]
+            except (OSError, UnicodeDecodeError):
+                pass
+        written = _write_with_newlines(resolved, content, newline)
         return ToolResult(
             output=(
                 f"{'Overwrote' if existed else 'Created'} {self._rel(resolved)} "
-                f"({len(content.encode('utf-8'))} bytes)."
+                f"({written} bytes)."
             ),
             metadata={
                 "path": self._rel(resolved),
-                "bytes_written": len(content.encode("utf-8")),
+                "bytes_written": written,
                 "created": not existed,
                 "overwritten": existed,
             },
@@ -457,11 +490,15 @@ class EditFileTool(_BuiltinTool):
                 f"path is a directory, not a file: {self._rel(resolved)}"
             )
         try:
-            text = resolved.read_text(encoding="utf-8")
+            text, newline = _read_keep_newlines(resolved)
         except UnicodeDecodeError:
             return ToolResult.from_error(
                 f"file is not valid UTF-8 text: {self._rel(resolved)}"
             )
+        old_string = old_string.replace("\r\n", "\n")
+        new_string = new_string.replace("\r\n", "\n")
+        if not old_string:
+            return ToolResult.from_error("old_string must not be empty")
 
         occurrences = text.count(old_string)
         if occurrences == 0:
@@ -474,16 +511,16 @@ class EditFileTool(_BuiltinTool):
 
         count = occurrences if replace_all else 1
         new_text = text.replace(old_string, new_string, -1 if replace_all else 1)
-        resolved.write_text(new_text, encoding="utf-8")
+        written = _write_with_newlines(resolved, new_text, newline)
         return ToolResult(
             output=(
                 f"Edited {self._rel(resolved)}: {count} replacement(s), "
-                f"{len(new_text.encode('utf-8'))} bytes."
+                f"{written} bytes."
             ),
             metadata={
                 "path": self._rel(resolved),
                 "replacements": count,
-                "bytes_written": len(new_text.encode("utf-8")),
+                "bytes_written": written,
             },
         )
 
@@ -557,6 +594,166 @@ class ListDirectoryTool(_BuiltinTool):
 
 
 # ---------------------------------------------------------------------------
+# search_files
+# ---------------------------------------------------------------------------
+
+#: Directories never searched (tooling, caches, dependencies, VCS).
+SEARCH_SKIP_DIRS = frozenset(
+    {
+        ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+        "__pycache__", ".forge", ".mypy_cache", ".pytest_cache", ".tox",
+        ".ruff_cache", "dist", "build", ".idea", ".vscode",
+    }
+)
+SEARCH_MAX_RESULTS_DEFAULT = 50
+SEARCH_MAX_RESULTS_CAP = 200
+_SEARCH_MAX_FILE_BYTES = 1_000_000
+_SEARCH_LINE_CHARS = 200
+
+
+class SearchFilesTool(_BuiltinTool):
+    """Find lines matching a pattern, so the agent reads only what it needs."""
+
+    @property
+    def name(self) -> str:
+        return "search_files"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search workspace text files for a regular expression and return "
+            "matching lines as 'path:line: text'. Use it to locate code, then "
+            "read just those lines with read_file start_line/end_line. Skips "
+            ".git, virtualenvs, node_modules and caches."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regular expression (Python syntax) to search for.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search (default '.').",
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Only search file names matching this glob, e.g. '*.py'.",
+                },
+                "ignore_case": {
+                    "type": "boolean",
+                    "description": "Case-insensitive match (default false).",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": (
+                        f"Maximum matching lines to return (default "
+                        f"{SEARCH_MAX_RESULTS_DEFAULT}, max {SEARCH_MAX_RESULTS_CAP})."
+                    ),
+                },
+            },
+            "required": ["pattern"],
+        }
+
+    def _run(self, **kwargs: Any) -> ToolResult:
+        import fnmatch
+        import os
+
+        _reject_unknown(
+            kwargs, {"pattern", "path", "glob", "ignore_case", "max_results"}
+        )
+        pattern = _str_arg(kwargs, "pattern")
+        if not pattern:
+            raise ValueError("pattern must not be empty")
+        path = _str_arg(kwargs, "path", required=False, default=".") or "."
+        glob = _str_arg(kwargs, "glob", required=False)
+        ignore_case = _bool_arg(kwargs, "ignore_case", default=False)
+        max_results = _int_arg(kwargs, "max_results", SEARCH_MAX_RESULTS_DEFAULT)
+        if max_results < 1:
+            raise ValueError("max_results must be >= 1")
+        max_results = min(max_results, SEARCH_MAX_RESULTS_CAP)
+
+        flags = re.IGNORECASE if ignore_case else 0
+        note = ""
+        try:
+            regex = re.compile(pattern, flags)
+        except re.error:
+            # Not a valid regex: search for the literal text instead.
+            regex = re.compile(re.escape(pattern), flags)
+            note = " (pattern was not a valid regex; matched it as plain text)"
+
+        root = self._root()
+        resolved = assert_within_workspace(path, self._workspace_root, operation="search")
+        if not resolved.exists():
+            return ToolResult.from_error(f"path not found: {self._rel(resolved)}")
+
+        if resolved.is_file():
+            candidates: Iterable[Path] = [resolved]
+        else:
+            def walk() -> Iterable[Path]:
+                for dirpath, dirnames, filenames in os.walk(resolved):
+                    dirnames[:] = sorted(d for d in dirnames if d not in SEARCH_SKIP_DIRS)
+                    for fname in sorted(filenames):
+                        yield Path(dirpath) / fname
+            candidates = walk()
+
+        matches: list[str] = []
+        total = 0
+        files_searched = 0
+        for file in candidates:
+            if glob and not fnmatch.fnmatch(file.name, glob):
+                continue
+            if is_secret_file(file):
+                continue
+            try:
+                if file.stat().st_size > _SEARCH_MAX_FILE_BYTES:
+                    continue
+                data = file.read_bytes()
+            except OSError:
+                continue
+            if b"\0" in data[:8192]:
+                continue  # binary
+            files_searched += 1
+            text = data.decode("utf-8", errors="replace")
+            try:
+                rel = file.relative_to(root).as_posix()
+            except ValueError:
+                rel = file.as_posix()
+            for number, line in enumerate(text.splitlines(), start=1):
+                if regex.search(line):
+                    total += 1
+                    if len(matches) < max_results:
+                        matches.append(f"{rel}:{number}: {_clip(line.strip(), _SEARCH_LINE_CHARS)}")
+
+        if not matches:
+            output = f"No matches for {pattern!r} in {files_searched} file(s){note}."
+        else:
+            output = "\n".join(matches)
+            if total > len(matches):
+                output += (
+                    f"\n[search_files: showing {len(matches)} of {total} matches; "
+                    "narrow the search with path or glob]"
+                )
+            if note:
+                output += f"\n[search_files:{note}]"
+        return ToolResult(
+            output=redact_secrets(output),
+            metadata={
+                "pattern": pattern,
+                "path": self._rel(resolved),
+                "matches": total,
+                "returned": len(matches),
+                "files_searched": files_searched,
+                "truncated": total > len(matches),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
 # run_shell
 # ---------------------------------------------------------------------------
 
@@ -624,6 +821,12 @@ class RunShellTool(_BuiltinTool):
         tokens = assert_safe_command(command)
 
         cwd = self._root()
+        if not cwd.is_dir():
+            # Clean error instead of a raw NotADirectoryError traceback.
+            return ToolResult.from_error(
+                f"workspace directory does not exist yet: {cwd}. Create a "
+                "file with write_file first (it creates the directory)."
+            )
         try:
             proc = subprocess.run(  # noqa: S603 - argv list, shell=False
                 tokens,
@@ -776,6 +979,7 @@ BUILTIN_TOOL_CLASSES: tuple[type[_BuiltinTool], ...] = (
     WriteFileTool,
     EditFileTool,
     ListDirectoryTool,
+    SearchFilesTool,
     RunShellTool,
 )
 
@@ -783,7 +987,7 @@ BUILTIN_TOOL_CLASSES: tuple[type[_BuiltinTool], ...] = (
 def register_builtin_tools(
     registry: ToolRegistry, *, workspace_root: str | Path | None = None
 ) -> ToolRegistry:
-    """Register the five built-in tools on *registry* and return it."""
+    """Register the six built-in tools on *registry* and return it."""
     for cls in BUILTIN_TOOL_CLASSES:
         registry.register(cls(workspace_root=workspace_root))
     return registry

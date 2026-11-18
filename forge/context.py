@@ -18,8 +18,10 @@ Status
   deterministic, rule-based pruning/compression policy that plugs into the
   same seam without touching the agent loop. See
   ``docs/step-06-managed-context.md`` for the full policy write-up.
-- Token counting is deliberately a character-count proxy for now; accurate
-  tokeniser-based counting is a later concern.
+- Step 11 adds ``StableContextStrategy``: the same rules as managed context,
+  but applied in occasional batches so the prompt prefix stays byte-identical
+  between batches and provider prompt caching keeps working. Budgets are in
+  estimated tokens (``forge.tokens``), not characters.
 
 Design
 ------
@@ -44,6 +46,7 @@ from dataclasses import dataclass, field
 
 from forge.llm import Message, ToolCall
 from forge.logging import get_logger
+from forge.tokens import estimate_messages_tokens
 
 logger = get_logger(__name__)
 
@@ -185,6 +188,11 @@ class ContextReport:
     turns_kept_recent: int = 0
     turns_kept_error: int = 0
     turns_dropped_for_budget: int = 0
+    #: Estimated tokens (forge.tokens) before / after; None if not computed.
+    tokens_before: int | None = None
+    tokens_after: int | None = None
+    #: StableContextStrategy only: True when this prepare() re-compacted.
+    compacted: bool = False
 
 
 class RawContextStrategy(ContextStrategy):
@@ -198,6 +206,7 @@ class RawContextStrategy(ContextStrategy):
     def prepare(self, context: "ConversationContext") -> list[Message]:
         messages = context.get_messages()
         chars = sum(len(m.content) for m in messages)
+        tokens = estimate_messages_tokens(messages)
         # Trivial pass-through report: nothing is ever dropped or compressed.
         # Recorded purely so run-level measurement code can treat every
         # ContextStrategy uniformly without an isinstance check.
@@ -206,6 +215,8 @@ class RawContextStrategy(ContextStrategy):
             items_after=len(messages),
             chars_before=chars,
             chars_after=chars,
+            tokens_before=tokens,
+            tokens_after=tokens,
         )
         return messages
 
@@ -254,8 +265,14 @@ def _is_error_tool_message(message: Message) -> bool:
 #: with missing/unparseable arguments falls back to a per-tool-name key (the
 #: pre-Fix-3 "latest per tool" behaviour). Any other tool gets a unique key.
 _KEYED_TOOLS = frozenset(
-    {"read_file", "run_shell", "list_directory", "edit_file", "write_file"}
+    {"read_file", "run_shell", "list_directory", "edit_file", "write_file",
+     "search_files"}
 )
+
+#: Metadata flag the agent sets on a tool result that only says "same result
+#: as an earlier identical call". Such a result must never supersede (and so
+#: hide) the earlier full result it points to.
+DUPLICATE_RESULT_FLAG = "forge_duplicate_result"
 _LABEL_MAX = 80
 
 
@@ -318,6 +335,15 @@ def _resource_key(
     args = call.arguments if call is not None else None
     if not isinstance(args, dict):
         return legacy
+
+    if name == "search_files":
+        pattern = args.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            return legacy
+        spec = f"{pattern} in {args.get('path') or '.'}"
+        if args.get("glob"):
+            spec += f" ({args['glob']})"
+        return ("search", spec, bool(args.get("ignore_case"))), _label(spec)
 
     if name == "run_shell":
         command = args.get("command")
@@ -413,6 +439,7 @@ class ManagedContextStrategy(ContextStrategy):
         keep_recent_turns: int = 3,
         max_messages: int = 40,
         max_chars: int = 20_000,
+        max_tokens: int | None = None,
     ) -> None:
         if keep_recent_turns < 0:
             raise ValueError("keep_recent_turns must be >= 0")
@@ -420,6 +447,9 @@ class ManagedContextStrategy(ContextStrategy):
             raise ValueError("max_messages must be >= 1")
         if max_chars < 1:
             raise ValueError("max_chars must be >= 1")
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+        self.max_tokens = max_tokens
         self.keep_recent_turns = keep_recent_turns
         self.max_messages = max_messages
         self.max_chars = max_chars
@@ -447,7 +477,12 @@ class ManagedContextStrategy(ContextStrategy):
             if i not in recent_idx
             and any(_is_error_tool_message(m) for m in turn)
         }
-        protected_idx = recent_idx | error_idx
+        # A later user message (a follow-up request in `forge chat`, or a
+        # harness note) is its own turn and is never compressed or dropped.
+        user_idx = {
+            i for i, turn in enumerate(turns) if turn and turn[0].role == "user"
+        }
+        protected_idx = recent_idx | error_idx | user_idx
 
         # Per-resource retention: for each resource key (which file was
         # read, which command was run, ...), the position (turn, index) of
@@ -465,6 +500,10 @@ class ManagedContextStrategy(ContextStrategy):
             for j, m in enumerate(turn):
                 if m.role == "tool" and not _is_error_tool_message(m):
                     key, label = _resource_key(m, calls.get(j), (i, j))
+                    if m.metadata.get(DUPLICATE_RESULT_FLAG):
+                        # Never let a "same as before" pointer supersede the
+                        # full result it refers to; it gets its own key.
+                        key = ("duplicate", (i, j))
                     keys[(i, j)] = key
                     labels[(i, j)] = label
                     latest_by_key[key] = (i, j)
@@ -498,8 +537,7 @@ class ManagedContextStrategy(ContextStrategy):
         turns_dropped_for_budget = 0
         dropped_idx: set[int] = set()
         for i in range(n_turns):
-            items, chars = self._totals(head, turn_outputs)
-            if items <= self.max_messages and chars <= self.max_chars:
+            if self._within_budget(head, turn_outputs):
                 break
             if i in protected_idx or not turn_outputs[i]:
                 continue
@@ -529,6 +567,8 @@ class ManagedContextStrategy(ContextStrategy):
 
         items_after = len(out)
         chars_after = sum(len(m.content) for m in out)
+        tokens_before = estimate_messages_tokens(messages)
+        tokens_after = estimate_messages_tokens(out)
 
         self._last_report = ContextReport(
             items_before=items_before,
@@ -541,12 +581,27 @@ class ManagedContextStrategy(ContextStrategy):
             turns_kept_recent=len(recent_idx),
             turns_kept_error=len(error_idx),
             turns_dropped_for_budget=turns_dropped_for_budget,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
         )
         return out
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _within_budget(
+        self, head: list[Message], turn_outputs: list[list[Message]]
+    ) -> bool:
+        items, chars = self._totals(head, turn_outputs)
+        if items > self.max_messages or chars > self.max_chars:
+            return False
+        if self.max_tokens is not None:
+            tokens = estimate_messages_tokens(head) + sum(
+                estimate_messages_tokens(t) for t in turn_outputs
+            )
+            return tokens <= self.max_tokens
+        return True
 
     @staticmethod
     def _totals(
@@ -591,6 +646,11 @@ class ManagedContextStrategy(ContextStrategy):
             if m.role == "assistant":
                 current = [m]
                 turns.append(current)
+            elif m.role == "user":
+                # A follow-up user message (chat) is its own turn, so it can
+                # be protected and never merged into a droppable tool turn.
+                turns.append([m])
+                current = None
             elif current is not None:
                 current.append(m)
             else:
@@ -613,6 +673,11 @@ class ManagedContextStrategy(ContextStrategy):
             marker = (
                 f"[MANAGED CONTEXT: older output of '{label}' omitted "
                 f"({chars} chars) — a later run exists]"
+            )
+        elif kind == "search":
+            marker = (
+                f"[MANAGED CONTEXT: older search for '{label}' omitted "
+                f"({chars} chars) — a later identical search exists]"
             )
         elif kind == "dir":
             marker = (
@@ -650,3 +715,129 @@ class ManagedContextStrategy(ContextStrategy):
             tool_calls=message.tool_calls,
             metadata={**message.metadata, "managed_context_compressed": True},
         )
+
+
+# ---------------------------------------------------------------------------
+# Stable (cache-friendly) context strategy (Step 11)
+# ---------------------------------------------------------------------------
+
+
+class StableContextStrategy(ContextStrategy):
+    """Managed context applied in batches, so provider prompt caching works.
+
+    Providers such as DeepSeek (served through OpenCode Go) cache the longest
+    *unchanged prefix* of a request and bill those tokens at a fraction of
+    the normal price. ``ManagedContextStrategy`` re-applies its rules on
+    every turn, so a message that turns "stale" gets rewritten and every
+    token after it misses the cache on the next call.
+
+    This strategy keeps the prompt append-only between compactions:
+
+    1. While the estimated size of (last snapshot + new messages) stays at or
+       below ``compact_at_tokens``, it sends exactly that — the previous
+       request is a byte-identical prefix of the new one.
+    2. When it grows past ``compact_at_tokens``, it runs the managed rules
+       once over the full raw history with a ``target_tokens`` budget and
+       freezes the result as the new snapshot. Only that one call pays for a
+       cache miss after the system prompt and task.
+    3. A compaction only happens again once the context has grown by at
+       least ``min_growth_tokens`` since the last one, so a history whose
+       protected part (task, errors, recent turns) alone exceeds the
+       threshold cannot trigger a re-compaction (and a cache miss) on every
+       turn.
+
+    All rules are deterministic: the same history and the same sequence of
+    ``prepare()`` calls always produce the same requests. A strategy object
+    holds per-conversation state; it resets itself automatically when it is
+    handed a different conversation.
+    """
+
+    name = "stable"
+
+    def __init__(
+        self,
+        *,
+        compact_at_tokens: int = 16_000,
+        target_tokens: int = 8_000,
+        keep_recent_turns: int = 3,
+        min_growth_tokens: int | None = None,
+    ) -> None:
+        if target_tokens < 1 or compact_at_tokens <= target_tokens:
+            raise ValueError("need 1 <= target_tokens < compact_at_tokens")
+        self.compact_at_tokens = compact_at_tokens
+        self.target_tokens = target_tokens
+        self.keep_recent_turns = keep_recent_turns
+        self.min_growth_tokens = (
+            min_growth_tokens
+            if min_growth_tokens is not None
+            else (compact_at_tokens - target_tokens) // 2
+        )
+        self._managed = ManagedContextStrategy(
+            keep_recent_turns=keep_recent_turns,
+            max_messages=10**9,
+            max_chars=10**12,
+            max_tokens=target_tokens,
+        )
+        self._last_report: ContextReport | None = None
+        self.compactions = 0
+        self._reset()
+
+    def _reset(self) -> None:
+        self._snapshot: list[Message] = []
+        self._covered = 0
+        self._first: Message | None = None
+        self._tokens_after_compact: int | None = None
+        self._force = False
+
+    def last_report(self) -> ContextReport | None:
+        return self._last_report
+
+    def request_compaction(self) -> None:
+        """Compact on the next ``prepare()`` regardless of size (``/compact``)."""
+        self._force = True
+
+    def prepare(self, context: "ConversationContext") -> list[Message]:
+        messages = context.get_messages()
+        if (
+            not messages
+            or messages[0] is not self._first
+            or len(messages) < self._covered
+        ):
+            force = self._force
+            self._reset()
+            self._force = force
+            self._first = messages[0] if messages else None
+
+        candidate = self._snapshot + messages[self._covered:]
+        tokens = estimate_messages_tokens(candidate)
+        grown_enough = (
+            self._tokens_after_compact is None
+            or tokens - self._tokens_after_compact >= self.min_growth_tokens
+        )
+        compacted = False
+        if self._force or (tokens > self.compact_at_tokens and grown_enough):
+            candidate = self._managed.prepare(context)
+            tokens = estimate_messages_tokens(candidate)
+            self._tokens_after_compact = tokens
+            self.compactions += 1
+            self._force = False
+            compacted = True
+        # Freeze what we send: the next request extends it, never rewrites it.
+        self._snapshot = list(candidate)
+        self._covered = len(messages)
+
+        items_after = len(candidate)
+        self._last_report = ContextReport(
+            items_before=len(messages),
+            items_after=items_after,
+            chars_before=sum(len(m.content) for m in messages),
+            chars_after=sum(len(m.content) for m in candidate),
+            items_dropped=max(len(messages) - items_after, 0),
+            items_compressed=sum(
+                1 for m in candidate if m.metadata.get("managed_context_compressed")
+            ),
+            tokens_before=estimate_messages_tokens(messages),
+            tokens_after=tokens,
+            compacted=compacted,
+        )
+        return candidate

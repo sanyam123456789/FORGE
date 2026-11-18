@@ -1,7 +1,18 @@
 """
-forge.cli — minimal command-line entry point.
+forge.cli — command-line entry point.
 
-    forge run --task "Create add.py with an add(a, b) function"
+Everyday use:
+
+    forge "fix the bug in app.py"        run one task (same as `forge run "..."`)
+    forge chat                           interactive session with /slash commands
+    forge bench                          run the comparison benchmark (all arms)
+    forge report                         readable table of the latest results
+
+Modes (--mode, or /mode in chat): baseline, lean-tools, lean-context, smart
+(default; see forge/modes.py).
+
+Research commands (unchanged):
+
     forge tasks
     forge evaluate --suite-task-id create-string-utils
     forge experiment --suite-dir experiments/tasks
@@ -29,7 +40,8 @@ significance labels; see docs/step-08-statistical-analysis.md. It never
 calls a provider or the network.
 
 run options:
-    --task TEXT              the coding task (required)
+    TASK / --task TEXT       the coding task (required)
+    --mode NAME              baseline | lean-tools | lean-context | smart (default)
     --workspace PATH         workspace root (default: current directory)
     --model NAME             override FORGE_LLM_MODEL
     --max-turns N            override max LLM turns
@@ -38,6 +50,16 @@ run options:
     --no-trace              do not write a JSONL run trace
     --json                  print the run summary as JSON
     --quiet                 only print the final answer
+    --verbose               print every run metric, not just the result line
+
+chat options:
+    --mode NAME / --workspace PATH / --model NAME / --no-trace
+
+bench options: as `experiment`, but runs all six arms by default (the 2x2
+plus fixed_stable and adaptive_stable) and prints the `report` table.
+
+report options:
+    RESULTS                  results JSONL (default: the newest under runs/)
 
 tasks options:
     --suite-dir PATH         task suite dir (default: experiments/tasks)
@@ -47,8 +69,9 @@ evaluate options:
     --task TEXT / --task-file PATH / --suite-task-id ID   (choose one)
     --task-id ID             override the stable task identity
     --suite-dir PATH         suite dir for --suite-task-id
-    --tool-strategy NAME     fixed | adaptive (both implemented)
-    --context-strategy NAME  raw | managed (both implemented)
+    --mode NAME              sets both strategies (baseline/lean-tools/lean-context/smart)
+    --tool-strategy NAME     fixed | adaptive
+    --context-strategy NAME  raw | managed | stable
     --workspace PATH         reuse a workspace (default: temp dir, cleaned)
     --results-file PATH      JSONL to append the result to
     --model / --max-turns / --max-tool-calls / --temperature / --no-trace / --json
@@ -120,14 +143,28 @@ from pathlib import Path
 
 from forge import __version__
 
+_ALL_ARM_IDS = [
+    "fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed",
+    "fixed_stable", "adaptive_stable",
+]
+_MODE_NAMES = ["baseline", "lean-tools", "lean-context", "smart"]
+_COMMANDS = {
+    "run", "chat", "bench", "report", "tasks", "evaluate", "experiment",
+    "demo", "analyze",
+}
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="forge", description="FORGE coding-agent harness")
     parser.add_argument("--version", action="version", version=f"forge {__version__}")
     sub = parser.add_subparsers(dest="command")
 
-    run = sub.add_parser("run", help="run the agent on a task")
-    run.add_argument("--task", required=True, help="the coding task, in natural language")
+    run = sub.add_parser("run", help="run the agent on one task")
+    run.add_argument("task_text", nargs="?", default=None, metavar="TASK",
+                     help="the coding task, in natural language")
+    run.add_argument("--task", default=None, help="the coding task (alternative to TASK)")
+    run.add_argument("--mode", default="smart", choices=_MODE_NAMES,
+                     help="strategy mode (default: smart)")
     run.add_argument("--workspace", default=None, help="workspace root (default: cwd)")
     run.add_argument("--model", default=None, help="override the model name")
     run.add_argument("--max-turns", type=int, default=None, help="max LLM turns")
@@ -136,6 +173,19 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-trace", action="store_true", help="do not write a JSONL trace")
     run.add_argument("--json", action="store_true", help="print the run summary as JSON")
     run.add_argument("--quiet", action="store_true", help="only print the final answer")
+    run.add_argument("--verbose", action="store_true", help="print every run metric")
+
+    chat = sub.add_parser("chat", help="interactive session with /slash commands")
+    chat.add_argument("--mode", default="smart", choices=_MODE_NAMES,
+                      help="strategy mode (default: smart)")
+    chat.add_argument("--workspace", default=None, help="workspace root (default: cwd)")
+    chat.add_argument("--model", default=None, help="override the model name")
+    chat.add_argument("--no-trace", action="store_true", help="do not write JSONL traces")
+
+    rep = sub.add_parser("report", help="readable per-arm table of experiment results")
+    rep.add_argument("results", nargs="?", default=None,
+                     help="results JSONL (default: newest results.jsonl under runs/)")
+    rep.add_argument("--json", action="store_true", help="print the report as JSON")
 
     tk = sub.add_parser("tasks", help="list the baseline evaluation task suite")
     tk.add_argument(
@@ -158,12 +208,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ev.add_argument("--task-id", default=None, help="override the stable task id (default: keep as defined)")
     ev.add_argument(
+        "--mode", default=None, choices=_MODE_NAMES,
+        help="set both strategies by mode name (overrides the two flags below)",
+    )
+    ev.add_argument(
         "--tool-strategy", default="fixed",
         help="tool exposure strategy (implemented: fixed, adaptive)",
     )
     ev.add_argument(
         "--context-strategy", default="raw",
-        help="context strategy (implemented: raw, managed)",
+        help="context strategy (implemented: raw, managed, stable)",
     )
     ev.add_argument("--workspace", default=None, help="reuse this workspace (default: temp dir, cleaned)")
     ev.add_argument("--model", default=None, help="override the model name")
@@ -182,31 +236,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "experiment",
         help="run the formal 2x2 controlled experiment (fixed/adaptive x raw/managed)",
     )
-    exp.add_argument(
-        "--suite-dir", default=None,
-        help="task suite directory (default: experiments/tasks)",
+    bench = sub.add_parser(
+        "bench",
+        help="run the benchmark: every task under all six arms, then print the report",
     )
-    exp.add_argument(
-        "--task-id", dest="task_ids", action="append", default=None,
-        help="restrict to this task_id (repeatable; default: the full suite)",
-    )
-    exp.add_argument(
-        "--arm", dest="arm_ids", action="append", default=None,
-        choices=["fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed"],
-        help="restrict to this arm (repeatable; default: all four)",
-    )
-    exp.add_argument(
-        "--output-dir", default=None,
-        help="where to write <experiment_id>/ (default: runs/experiments)",
-    )
-    exp.add_argument("--experiment-id", default=None, help="override the generated experiment id")
-    exp.add_argument("--label", default=None, help="optional batch label recorded with every result")
-    exp.add_argument("--model", default=None, help="override the model name")
-    exp.add_argument("--max-turns", type=int, default=None, help="max LLM turns")
-    exp.add_argument("--max-tool-calls", type=int, default=None, help="max tool calls")
-    exp.add_argument("--temperature", type=float, default=None, help="sampling temperature")
-    exp.add_argument("--no-trace", action="store_true", help="do not write per-run JSONL traces")
-    exp.add_argument("--json", action="store_true", help="print the experiment summary as JSON")
+    _add_matrix_args(exp, default_arms="all four")
+    _add_matrix_args(bench, default_arms="all six")
 
     demo = sub.add_parser(
         "demo",
@@ -222,7 +257,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     demo.add_argument(
         "--arm", dest="arm_ids", action="append", default=None,
-        choices=["fixed_raw", "fixed_managed", "adaptive_raw", "adaptive_managed"],
+        choices=_ALL_ARM_IDS,
         help="restrict to this arm (repeatable; default: all four)",
     )
     demo.add_argument(
@@ -271,15 +306,51 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_matrix_args(p: argparse.ArgumentParser, *, default_arms: str) -> None:
+    """Arguments shared by `experiment` and `bench`."""
+    p.add_argument(
+        "--suite-dir", default=None,
+        help="task suite directory (default: experiments/tasks)",
+    )
+    p.add_argument(
+        "--task-id", dest="task_ids", action="append", default=None,
+        help="restrict to this task_id (repeatable; default: the full suite)",
+    )
+    p.add_argument(
+        "--arm", dest="arm_ids", action="append", default=None,
+        choices=_ALL_ARM_IDS,
+        help=f"restrict to this arm (repeatable; default: {default_arms})",
+    )
+    p.add_argument(
+        "--output-dir", default=None,
+        help="where to write <experiment_id>/ (default: runs/experiments)",
+    )
+    p.add_argument("--experiment-id", default=None, help="override the generated experiment id")
+    p.add_argument("--label", default=None, help="optional batch label recorded with every result")
+    p.add_argument("--model", default=None, help="override the model name")
+    p.add_argument("--max-turns", type=int, default=None, help="max LLM turns")
+    p.add_argument("--max-tool-calls", type=int, default=None, help="max tool calls")
+    p.add_argument("--temperature", type=float, default=None, help="sampling temperature")
+    p.add_argument("--no-trace", action="store_true", help="do not write per-run JSONL traces")
+    p.add_argument("--json", action="store_true", help="print the experiment summary as JSON")
+
+
 def _run_command(args: argparse.Namespace) -> int:
     # Imports are deferred so that `forge --help` / `forge --version` do not
     # need the provider SDK or a configured environment.
     import os
 
     from forge.agent import STATUS_COMPLETED, AgentConfig, AgentRuntime
+    from forge.chat import result_line
     from forge.config import load_settings
     from forge.llm import get_provider
     from forge.logging import setup_logging
+    from forge.modes import build_strategies
+
+    task = args.task or args.task_text
+    if not task:
+        print("error: give a task, e.g. forge \"fix the bug in app.py\"", file=sys.stderr)
+        return 2
 
     if args.model:
         os.environ["FORGE_LLM_MODEL"] = args.model
@@ -297,12 +368,15 @@ def _run_command(args: argparse.Namespace) -> int:
         return 2
 
     if not args.quiet and not args.json:
-        print(f"FORGE {__version__}  provider={settings.llm_provider} model={settings.llm_model}")
+        print(f"FORGE {__version__} · {settings.llm_model} · mode: {args.mode}")
         print(f"workspace: {settings.workspace_root}")
-        print(f"task: {args.task}\n")
+        print(f"task: {task}\n")
 
+    tool_exposure, context_strategy = build_strategies(args.mode)
     config = AgentConfig(
-        task=args.task,
+        task=task,
+        tool_exposure=tool_exposure,
+        context_strategy=context_strategy,
         max_llm_turns=args.max_turns,
         max_tool_calls=args.max_tool_calls,
         temperature=args.temperature,
@@ -313,6 +387,10 @@ def _run_command(args: argparse.Namespace) -> int:
         workspace_root=settings.workspace_root,
         write_trace=not args.no_trace,
         log_dir=settings.log_dir,
+        on_tool_call=(
+            None if (args.quiet or args.json) else
+            lambda name, a: print(f"  · {name} {_brief_args(a)}")
+        ),
     )
 
     run = runtime.run()
@@ -331,6 +409,9 @@ def _run_command(args: argparse.Namespace) -> int:
         "llm_latency_ms": round(run.llm_latency_ms, 1) if run.llm_latency_ms else None,
         "context_messages": run.context_messages,
         "context_char_count": run.context_char_count,
+        "duplicate_reads_collapsed": run.duplicate_reads_collapsed,
+        "hidden_tool_calls_refused": run.hidden_tool_calls_refused,
+        "length_continuations": run.length_continuations,
         "trace_path": str(run.trace_path) if run.trace_path else None,
         "error": run.error,
     }
@@ -340,11 +421,17 @@ def _run_command(args: argparse.Namespace) -> int:
     elif args.quiet:
         print(run.final_answer)
     else:
-        print("--- final answer ---")
-        print(run.final_answer or "(no final answer)")
-        print("\n--- run summary ---")
-        for key, value in summary.items():
-            print(f"  {key}: {value}")
+        print()
+        print(run.final_answer.strip() if run.final_answer else "(no final answer)")
+        if run.error:
+            print(f"error: {run.error}")
+        print()
+        print(result_line(run))
+        if args.verbose:
+            for key, value in summary.items():
+                print(f"  {key}: {value}")
+        elif run.trace_path:
+            print(f"trace: {run.trace_path}")
 
     return 0 if run.status == STATUS_COMPLETED else 1
 
@@ -426,11 +513,17 @@ def _evaluate_command(args: argparse.Namespace) -> int:
     # because an unrecognised --tool-strategy/--context-strategy value
     # raises ValueError at construction time, in __post_init__.
     try:
+        tool_name, context_name = args.tool_strategy, args.context_strategy
+        if args.mode:
+            from forge.modes import get_mode
+
+            mode = get_mode(args.mode)
+            tool_name, context_name = mode.tool_strategy, mode.context_strategy
         experiment = ExperimentConfig.from_settings(
             settings,
             task_id=task.task_id,
-            tool_strategy=args.tool_strategy,
-            context_strategy=args.context_strategy,
+            tool_strategy=tool_name,
+            context_strategy=context_name,
             max_llm_turns=args.max_turns,
             max_tool_calls=args.max_tool_calls,
             label=args.label,
@@ -499,7 +592,13 @@ def _experiment_command(args: argparse.Namespace) -> int:
     import os
 
     from forge.config import load_settings
-    from forge.evaluation import ARMS, MatrixRunner, aggregate_results, arms_by_ids
+    from forge.evaluation import (
+        ALL_ARMS,
+        ARMS,
+        MatrixRunner,
+        aggregate_results,
+        arms_by_ids,
+    )
     from forge.evaluation.suite import DEFAULT_TASKS_DIR, TaskSuiteError, load_suite
     from forge.llm import get_provider
     from forge.logging import setup_logging
@@ -533,8 +632,10 @@ def _experiment_command(args: argparse.Namespace) -> int:
     else:
         tasks = suite
 
+    is_bench = args.command == "bench"
     try:
-        arms = arms_by_ids(args.arm_ids) if args.arm_ids else ARMS
+        default_arms = ALL_ARMS if is_bench else ARMS
+        arms = arms_by_ids(args.arm_ids) if args.arm_ids else default_arms
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -550,7 +651,7 @@ def _experiment_command(args: argparse.Namespace) -> int:
     output_root = Path(args.output_dir) if args.output_dir else Path("runs") / "experiments"
 
     if not args.json:
-        print(f"FORGE {__version__}  experiment  provider={settings.llm_provider} model={settings.llm_model}")
+        print(f"FORGE {__version__}  {args.command}  provider={settings.llm_provider} model={settings.llm_model}")
         print(f"tasks: {[t.task_id for t in tasks]}")
         print(f"arms:  {[a.arm_id for a in arms]}")
         print(f"output: {output_root}\n")
@@ -593,6 +694,12 @@ def _experiment_command(args: argparse.Namespace) -> int:
             agg = aggregates[arm.arm_id]
             rate = f"{agg.success_rate:.0%}" if agg.success_rate is not None else "n/a"
             print(f"  {arm.arm_id:<20} {agg.task_count:>5} {agg.successful_tasks:>7} {rate:>6}")
+        if is_bench:
+            from forge.evaluation.report import build_report, format_report
+
+            print()
+            print(format_report(build_report(results)))
+            print(f"\n(show again any time: forge report {summary.results_file})")
 
     return 0
 
@@ -781,11 +888,101 @@ def _analyze_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _brief_args(args: dict) -> str:
+    """Short one-line view of tool arguments for progress output."""
+    for key in ("path", "command", "pattern"):
+        if isinstance(args.get(key), str):
+            value = args[key].replace("\n", " ")
+            return value if len(value) <= 70 else value[:67] + "..."
+    return ""
+
+
+def _chat_command(args: argparse.Namespace) -> int:
+    import os
+
+    from forge.chat import ChatSession, run_repl
+    from forge.config import load_settings
+    from forge.llm import get_provider
+    from forge.logging import setup_logging
+
+    if args.model:
+        os.environ["FORGE_LLM_MODEL"] = args.model
+    if args.workspace:
+        os.environ["FORGE_WORKSPACE_ROOT"] = str(Path(args.workspace).resolve())
+    settings = load_settings()
+    # Chat output is the conversation; keep routine log lines out of it.
+    setup_logging(level="WARNING", fmt=settings.log_format)
+    try:
+        provider = get_provider(settings_override=settings)
+        provider.preflight()
+    except (ImportError, NotImplementedError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        import readline  # noqa: F401 - line editing/history where available
+    except ImportError:
+        pass
+
+    session = ChatSession(
+        settings=settings,
+        mode=args.mode,
+        provider=provider,
+        write_trace=not args.no_trace,
+        on_tool_call=lambda name, a: print(f"  · {name} {_brief_args(a)}"),
+    )
+    return run_repl(session)
+
+
+def _report_command(args: argparse.Namespace) -> int:
+    from forge.evaluation.report import latest_results_file, report_file
+
+    path = Path(args.results) if args.results else latest_results_file()
+    if path is None or not path.exists():
+        where = args.results or "runs/"
+        print(f"error: no results file found ({where}). Run `forge bench` first.", file=sys.stderr)
+        return 2
+    try:
+        reports, table = report_file(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        import dataclasses
+
+        print(json.dumps(
+            [{**dataclasses.asdict(r), "success_rate": r.success_rate} for r in reports],
+            indent=2,
+        ))
+        return 0
+    print(f"results: {path}\n")
+    print(table)
+    print("\n  tok/solved = all tokens the arm used / tasks it solved (lower is better)")
+    print("  uncached in = input tokens billed at full price; cached = share served from cache")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to a legacy code page; never crash on output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # `forge "some task"` is shorthand for `forge run "some task"`.
+    if argv and argv[0] not in _COMMANDS and not argv[0].startswith("-"):
+        argv = ["run", *argv]
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
         return _run_command(args)
+    if args.command == "chat":
+        return _chat_command(args)
+    if args.command == "report":
+        return _report_command(args)
+    if args.command == "bench":
+        return _experiment_command(args)
     if args.command == "tasks":
         return _tasks_command(args)
     if args.command == "evaluate":

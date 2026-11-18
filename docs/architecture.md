@@ -20,7 +20,7 @@ agent in production use.
 
 ---
 
-## Agent Loop (implemented in Step 2)
+## Agent Loop (Step 2, extended in Step 11)
 
 `AgentRuntime.run()` (`forge/agent.py`) executes:
 
@@ -100,16 +100,21 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.llm` | Provider-agnostic vocabulary (`Message`, `ToolCall`, `LLMResponse`, `LLMError`), the `LLMProvider` ABC, and `get_provider()`. |
 | `forge.providers` | Concrete adapters. `forge.providers.openai_compat` (presets `opencode_go`, `openai_compatible`; standard library only) plus the provider-agnostic `fallback`. Nothing else talks to a provider API. |
 | `forge.tools` | `Tool` ABC, `ToolRegistry` (`get_schemas(subset)` = exposure hook), and the `ToolExposureStrategy` seam (`FixedToolExposure`, `AdaptiveToolExposure` — Step 5). |
-| `forge.builtin_tools` | The five concrete tools + `build_default_registry()`. |
-| `forge.context` | `ConversationContext` history container + the `ContextStrategy` seam (`RawContextStrategy`, `ManagedContextStrategy` — Step 6) and `ContextReport` measurement. |
+| `forge.builtin_tools` | The six concrete tools (incl. `search_files`, Step 11) + `build_default_registry()`. `write_file`/`edit_file` keep each file's line endings. |
+| `forge.context` | `ConversationContext` history container + the `ContextStrategy` seam (`RawContextStrategy`, `ManagedContextStrategy` — Step 6, `StableContextStrategy` — Step 11, cache-friendly) and `ContextReport` measurement (chars and estimated tokens). |
 | `forge.prompts` | Canonical `FORGE_SYSTEM_PROMPT` and its stable `sha256` identifier. |
-| `forge.agent` | The agent loop. Owns the run lifecycle, hard limits, tool dispatch, and error handling. |
+| `forge.agent` | The agent loop. Owns the run lifecycle, limits, tool dispatch, error handling, and the Step 11 token savers (exposure enforcement + `enable_tool`, duplicate-read collapsing, stall and repeated-failure nudges, cut-off continuation, workspace map). Can continue an existing conversation (`context=`). |
+| `forge.tokens` | Dependency-free token estimate used for context budgets (Step 11). |
+| `forge.workspace_map` | Compact workspace file list for the first message (Step 11). |
+| `forge.modes` | Plain-language modes: `baseline`, `lean-tools`, `lean-context`, `smart` (Step 11). |
+| `forge.chat` | `forge chat`: conversation, slash commands, `/diff` and `/undo` snapshots (Step 11). |
 | `forge.observability` | Record typed events per run. Flush to JSONL. Never fabricate measurements (`None` ≠ `0`). |
 | `forge.evaluation` | Step 3 measurement layer *above* `AgentRuntime`: `EvalTask`, `ExperimentConfig`, `EvaluationRunner`, `EvalResult` (JSONL), `aggregate_results`. `fixed`/`adaptive` tool strategies (Step 5) and `raw`/`managed` context strategies (Step 6) are all implemented and freely combinable. See `docs/step-03-evaluation.md`, `docs/step-05-adaptive-tool-exposure.md`, `docs/step-06-managed-context.md`. |
 | `forge.evaluation.suite` | Step 4 loader for the version-controlled baseline task suite in `experiments/tasks/` (→ ordinary `EvalTask`s, with fixtures provisioned into the run workspace). See `docs/step-04-baseline-tasks.md`. |
 | `forge.evaluation.matrix` | Step 7 formal 2x2 controlled experiment: `ExperimentArm`, `ARMS`, `MatrixRunner` runs every selected task under every arm (`fixed_raw`, `fixed_managed`, `adaptive_raw`, `adaptive_managed`), each in its own isolated workspace, and writes one reloadable JSONL results file + a metadata file per experiment. Orchestration only — every task-arm execution is one `EvaluationRunner.run()` call. See `docs/step-07-controlled-2x2-experiment.md`. |
 | `forge.evaluation.analysis` | Step 8 statistical analysis: reads a Step 7 `results.jsonl` (+ optional `metadata.json`) and computes outcome/metric summaries, paired task comparisons, factor-level (tool exposure / context strategy / interaction) comparisons, and a stdlib-only Wilcoxon signed-rank *statistic* — descriptive only, no p-values/significance labels. No agent loop, no provider or network call. See `docs/step-08-statistical-analysis.md`. |
-| `forge.cli` | `forge run --task "..."`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`, `forge experiment` (the 2x2 matrix), `forge analyze` (Step 8 comparison). |
+| `forge.evaluation.report` | `forge report`: readable per-arm table (tokens per solved task, uncached input, cache hit rate) (Step 11). |
+| `forge.cli` | `forge "task"` / `forge run`, `forge chat`, `forge bench`, `forge report`, `forge tasks`, `forge evaluate (--task / --task-file / --suite-task-id)`, `forge experiment` (the 2x2 matrix), `forge analyze` (Step 8 comparison). |
 
 ---
 
@@ -186,7 +191,7 @@ comparison.
 | Cached input / reasoning tokens | `LLMResponse.cached_input_tokens` / `.reasoning_tokens` |
 | Inference cost | Derived later from token counts + provider pricing |
 | Latency | `RunTracer.record_llm_response(latency_ms=...)` |
-| Context size | `ConversationContext.approximate_char_count` (char proxy) |
+| Context size | `ConversationContext.approximate_char_count` (char proxy); estimated tokens in `ContextReport` (Step 11) |
 | Context size before/after management, items dropped/compressed | `ContextStrategy.last_report()` (`ContextReport`) → `RunTracer` per-turn `llm_call` events + cumulative `AgentRun`/`EvalResult` fields (Step 6) |
 | LLM calls | `RunTracer._llm_calls` |
 | Tool calls | RunTracer._tool_calls |

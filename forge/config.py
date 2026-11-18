@@ -92,6 +92,11 @@ class ForgeSettings:
     # look like secrets (FORGE_SHELL_ENV_ALLOW). FORGE_* is never passed.
     shell_env_allow: tuple[str, ...] = field(default_factory=tuple)
 
+    # --- Token savers ---
+    # Prepend a compact list of workspace files to the task (FORGE_REPO_MAP),
+    # so the agent does not spend turns exploring with list_directory.
+    repo_map: bool = field(default=True)
+
     def __repr__(self) -> str:  # pragma: no cover
         """Redact secret fields from string representation."""
         key_hint = "***" if self.llm_api_key else "<not set>"
@@ -141,6 +146,20 @@ def _get_int(key: str, default: int, *, min_value: int | None = None) -> int:
             f"allowed value ({min_value})."
         )
     return value
+
+
+def _get_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"FORGE configuration error: {key}={raw!r} is not a boolean "
+        "(use true/false)."
+    )
 
 
 def _get_float(
@@ -275,6 +294,7 @@ def load_settings() -> ForgeSettings:
         log_format=log_format_raw,  # type: ignore[arg-type]
         log_dir=_get_path("FORGE_LOG_DIR", Path("logs")),
         shell_env_allow=_get_list("FORGE_SHELL_ENV_ALLOW"),
+        repo_map=_get_bool("FORGE_REPO_MAP", True),
     )
 
 

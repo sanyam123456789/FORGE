@@ -321,7 +321,7 @@ class TestObservabilityWiring:
         assert start["context_strategy"] == "raw"
         assert start["system_prompt_id"].startswith("sha256:")
         assert start["temperature"] is not None
-        assert start["max_output_tokens"] is not None
+        assert "max_output_tokens" in start  # None = no output cap (the default)
 
     def test_run_end_carries_token_totals(self, registry, tmp_path):
         provider = ScriptedProvider(
@@ -352,7 +352,7 @@ class TestFixedToolExposure:
         for call in provider.calls:
             names = {t["function"]["name"] for t in call["tools"]}
             assert names == set(registry.list_names())
-            assert len(names) == 5
+            assert len(names) == 6
 
     def test_pinned_subset_limits_exposure_but_stays_fixed(self, registry, tmp_path):
         provider = ScriptedProvider([_text("done")])
@@ -409,10 +409,11 @@ class TestAdaptiveToolExposureEndToEnd:
         assert (tmp_path / "add.py").read_text(encoding="utf-8").startswith("def add")
 
         # Every turn saw the same narrowed subset — edit_file / run_shell were
-        # never offered because the task did not need them.
+        # never offered because the task did not need them (only the small
+        # enable_tool meta-tool that could turn them on).
         for call in provider.calls:
             names = {t["function"]["name"] for t in call["tools"]}
-            assert names == {"read_file", "write_file", "list_directory"}
+            assert names == {"read_file", "write_file", "list_directory", "enable_tool"}
 
     def test_edit_task_excludes_write_file_and_run_shell(self, registry, tmp_path):
         (tmp_path / "ranges.py").write_text(
@@ -439,7 +440,9 @@ class TestAdaptiveToolExposureEndToEnd:
 
         assert run.status == STATUS_COMPLETED
         names = {t["function"]["name"] for t in provider.calls[0]["tools"]}
-        assert names == {"read_file", "edit_file", "list_directory"}
+        assert names == {
+            "read_file", "edit_file", "list_directory", "search_files", "enable_tool"
+        }
         assert "write_file" not in names
         assert "run_shell" not in names
 

@@ -7,6 +7,11 @@ The system prompt lives here so that:
   which lets later controlled experiments verify that two runs shared the
   same prompt while another variable was changed.
 
+The prompt deliberately does not list tool names: the tools actually offered
+are sent with each request, and they differ between tool-exposure
+strategies. Naming tools here would advertise tools a strategy has hidden,
+and would make the prompt (and its hash) differ between experiment arms.
+
 Keep prompts concise.  Do not embed task-specific instructions here.
 """
 
@@ -22,14 +27,19 @@ Environment:
 - You work inside a single bounded workspace directory. Every path you use is \
 interpreted relative to that workspace, and you cannot read or write anything \
 outside it.
-- You have a fixed set of tools: read_file, write_file, edit_file, \
-list_directory, run_shell. This set does not change during a run.
+- Your tools are the ones provided with each request; the set can differ \
+between tasks. If a tool you need is not offered and enable_tool is, use \
+enable_tool to turn it on.
 
 How to work:
 - Use tools whenever you need to inspect the workspace, change files, or run \
-commands. You may request one or more tool calls per turn.
-- Read a file before you edit it. Prefer small, targeted edits over rewriting \
-whole files.
+commands. When several tool calls do not depend on each other, request them \
+together in one turn.
+- To find code, search for it (search_files, when available) and read only \
+the lines you need (read_file with start_line/end_line) instead of whole \
+large files.
+- Read a file before you edit it. Prefer small, targeted edit_file changes \
+over rewriting whole files.
 - Keep shell commands simple. Destructive commands (rm, del, mkfs, ...) and \
 network commands (curl, wget, ...) are blocked by the harness and will return \
 an error.
@@ -37,8 +47,9 @@ an error.
 again rather than repeating the identical call.
 
 Finishing:
-- When the task is complete, reply with a short plain-text summary of what you \
-did and make no further tool calls. That final message ends the run.
+- When the task is complete, reply with a short plain-text summary (one to \
+three sentences) of what you did and make no further tool calls. That final \
+message ends the run.
 """
 
 

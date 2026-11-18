@@ -33,6 +33,7 @@ _FORGE_ENV_KEYS = [
     "FORGE_LOG_FORMAT",
     "FORGE_LOG_DIR",
     "FORGE_SHELL_ENV_ALLOW",
+    "FORGE_REPO_MAP",
     # Not FORGE_-prefixed, but read by the opencode_go provider preset.
     "OPENCODE_API_KEY",
 ]

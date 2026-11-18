@@ -1,5 +1,5 @@
 """
-Tests for forge.builtin_tools — the five built-in coding tools.
+Tests for forge.builtin_tools — the six built-in coding tools.
 
 Every tool is bound to a tmp_path workspace so no test touches the real repo.
 """
@@ -268,7 +268,7 @@ class TestRunShell:
 
 
 class TestRegistration:
-    def test_build_default_registry_has_five_tools(self, ws):
+    def test_build_default_registry_has_six_tools(self, ws):
         registry = build_default_registry(workspace_root=ws)
         assert isinstance(registry, ToolRegistry)
         assert registry.list_names() == [
@@ -276,13 +276,14 @@ class TestRegistration:
             "list_directory",
             "read_file",
             "run_shell",
+            "search_files",
             "write_file",
         ]
 
     def test_register_builtin_tools_on_existing_registry(self, ws):
         registry = ToolRegistry()
         register_builtin_tools(registry, workspace_root=ws)
-        assert len(registry) == 5
+        assert len(registry) == 6
 
     def test_all_tools_expose_valid_schema(self, ws):
         registry = build_default_registry(workspace_root=ws)
