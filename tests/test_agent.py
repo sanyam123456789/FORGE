@@ -202,10 +202,10 @@ class TestFailureModes:
         assert "not found" in tool_msgs[0].content.lower()
 
     def test_provider_error_stops_run_cleanly(self, registry, tmp_path):
-        provider = ScriptedProvider([LLMError("gemini exploded")])
+        provider = ScriptedProvider([LLMError("provider exploded")])
         run = _runtime(AgentConfig(task="t"), provider, registry, tmp_path).run()
         assert run.status == STATUS_PROVIDER_ERROR
-        assert "gemini exploded" in run.error
+        assert "provider exploded" in run.error
         assert run.trace_path.exists()
 
     def test_unexpected_exception_marks_run_failed(self, registry, tmp_path):

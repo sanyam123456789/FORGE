@@ -160,7 +160,8 @@ class AgentRuntime:
         temperature = (
             cfg.temperature if cfg.temperature is not None else settings.llm_temperature
         )
-        max_output_tokens = cfg.max_output_tokens or settings.llm_max_output_tokens
+        # 0 / None = no output cap: max_tokens is left out of the request.
+        max_output_tokens = (cfg.max_output_tokens or settings.llm_max_output_tokens) or None
 
         # ``tool_subset`` on the config is a convenience: if the user pinned a
         # static list but left the default FixedToolExposure, wire it in. This
@@ -198,7 +199,7 @@ class AgentRuntime:
         try:
             turn = 0
             while True:
-                if turn >= max_turns:
+                if max_turns and turn >= max_turns:
                     run.status = STATUS_MAX_TURNS
                     break
                 turn += 1
@@ -292,7 +293,7 @@ class AgentRuntime:
 
                 hit_tool_limit = False
                 for call in response.tool_calls:
-                    if tool_calls_made >= max_tool_calls:
+                    if max_tool_calls and tool_calls_made >= max_tool_calls:
                         hit_tool_limit = True
                         break
                     tool_calls_made += 1

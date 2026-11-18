@@ -43,8 +43,8 @@ class ToolCall:
         is responsible for parsing provider-native argument payloads).
     provider_signature:
         Optional opaque token some providers attach to a tool-call and require
-        to be echoed back verbatim on the following request (e.g. Gemini 3.x
-        ``thought_signature``).  FORGE never inspects, decodes or mutates it —
+        to be echoed back verbatim on the following request (e.g. DeepSeek
+        ``reasoning_content`` on OpenAI-compatible endpoints).  FORGE never inspects, decodes or mutates it —
         it is carried through the conversation history untouched and handed
         back to the same provider adapter.  ``None`` when the provider does
         not use one.
@@ -197,7 +197,7 @@ class LLMProvider(ABC):
         messages: list[Message],
         *,
         tools: list[dict[str, Any]] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.0,
     ) -> LLMResponse:
         """Send *messages* to the LLM and return a normalised response.
@@ -211,7 +211,8 @@ class LLMProvider(ABC):
             function) format, as produced by ``Tool.to_schema()``.  ``None``
             or empty means the model is called without tool-use capability.
         max_tokens:
-            Maximum number of output tokens to generate.
+            Maximum number of output tokens to generate. ``None`` = no cap
+            (the provider's own default applies).
         temperature:
             Sampling temperature (0.0 = deterministic/greedy).
 
@@ -243,12 +244,12 @@ class LLMProvider(ABC):
     @property
     @abstractmethod
     def provider_name(self) -> str:
-        """Human-readable provider identifier (e.g. 'gemini')."""
+        """Human-readable provider identifier (e.g. 'opencode_go')."""
 
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """Model identifier as sent to the provider (e.g. 'gemini-3.6-flash')."""
+        """Model identifier as sent to the provider (e.g. 'deepseek-v4.1-flash')."""
 
 
 # ---------------------------------------------------------------------------
@@ -265,39 +266,47 @@ def _build_named_provider(name: str, settings: Any) -> LLMProvider:
     candidate in a fallback chain up front, even ones that are not yet
     configured, and only find out they are unusable when actually reached.
     """
-    if name == "gemini":
-        from forge.providers.gemini import GeminiProvider
+    if name in ("opencode_go", "openai_compatible"):
+        import os
 
-        return GeminiProvider(
-            api_key=settings.llm_api_key or None,
-            model=settings.llm_model,
+        from forge.providers.openai_compat import (
+            DEFAULT_TIMEOUT_S,
+            OPENCODE_GO_BASE_URL,
+            OPENCODE_GO_DEFAULT_MODEL,
+            OpenAICompatibleProvider,
         )
 
-    if name == "groq":
-        from forge.providers.groq import GroqProvider
+        timeout = getattr(settings, "llm_request_timeout_s", None)
+        common = {
+            "timeout": DEFAULT_TIMEOUT_S if timeout is None else timeout,
+            "retry_max": getattr(settings, "provider_retry_max", 3),
+        }
+        base_url = getattr(settings, "llm_base_url", "") or ""
+        api_key = getattr(settings, "llm_api_key", "") or ""
+        model = getattr(settings, "llm_model", "") or ""
 
-        return GroqProvider(
-            api_key=getattr(settings, "groq_api_key", "") or None,
-            model=getattr(settings, "groq_model", ""),
-            retry_max=getattr(settings, "provider_retry_max", 3),
-            timeout=getattr(settings, "llm_request_timeout_s", None),
-        )
-
-    if name == "cerebras":
-        from forge.providers.cerebras import CerebrasProvider
-
-        return CerebrasProvider(
-            api_key=getattr(settings, "cerebras_api_key", "") or None,
-            model=getattr(settings, "cerebras_model", ""),
-            retry_max=getattr(settings, "provider_retry_max", 3),
-            timeout=getattr(settings, "llm_request_timeout_s", None),
+        if name == "opencode_go":
+            return OpenAICompatibleProvider(
+                base_url=base_url or OPENCODE_GO_BASE_URL,
+                api_key=api_key or os.environ.get("OPENCODE_API_KEY", "").strip(),
+                model=model or OPENCODE_GO_DEFAULT_MODEL,
+                provider_label="opencode_go",
+                api_key_env="FORGE_LLM_API_KEY (or OPENCODE_API_KEY)",
+                **common,
+            )
+        return OpenAICompatibleProvider(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            provider_label="openai_compatible",
+            **common,
         )
 
     raise NotImplementedError(
         f"LLM provider adapter for '{name}' is not implemented. "
-        "Implemented adapters: gemini, groq, cerebras. Additional adapters "
-        "(openai, anthropic, ...) can be added under forge/providers/ "
-        "behind the same LLMProvider interface."
+        "Implemented adapters: opencode_go, openai_compatible. Additional "
+        "adapters can be added under forge/providers/ behind the same "
+        "LLMProvider interface."
     )
 
 

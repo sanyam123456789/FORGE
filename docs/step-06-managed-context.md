@@ -392,3 +392,37 @@ design (see Limitations).
 All existing Step 1–5 tests were re-run unmodified except the ones noted
 above, whose assertions specifically encoded "managed context is not
 implemented yet" — the premise Step 6 exists to change.
+
+## 11. Per-resource retention (update)
+
+Rule 5 originally kept only the latest successful result **per tool name**.
+That lost information on multi-file tasks: reading `app.py` and then
+`database.py` compressed `app.py` even though it was still needed. Rule 5
+now keeps the latest successful result **per resource**:
+
+- Each tool result gets a resource key from its matching tool call in the
+  same turn: `read_file` -> the file path, `run_shell` -> the command
+  (whitespace collapsed), `list_directory` -> the directory (default `.`),
+  `edit_file` / `write_file` -> the written path. Writes use their own
+  namespace, so a write never causes a read to be dropped.
+- Paths are normalized before comparison: backslashes become `/`,
+  `posixpath.normpath` is applied, a leading `./` is removed, and the path
+  is case-folded on Windows. `src\app.py` and `./src/app.py` share one key.
+- For each key, only the most recent successful result among the older,
+  non-protected turns is kept in full. Older results with the same key are
+  replaced by a marker that names the resource, e.g.
+  `[MANAGED CONTEXT: older read of 'app.py' omitted (812 chars) — superseded by a later read; call read_file again if needed]`
+  or
+  `[MANAGED CONTEXT: older output of 'python -m pytest -q' omitted (2400 chars) — a later run exists]`.
+- Results with different keys never affect each other: `app.py` and
+  `database.py` both stay in full.
+- Results are paired with their calls **within each turn** (by
+  `tool_call_id`, then by position), never across the whole history,
+  because some providers reuse ids such as `call_0` every turn.
+- A built-in tool call with missing or unparseable arguments falls back to
+  the original per-tool-name key. Any other (non-built-in) tool gets a
+  unique key and is never collapsed.
+
+Unchanged: the system/task head, the recent window, error-turn protection,
+the hard budget (dropping whole oldest unprotected turns), the "never make a
+message longer" rule, `ContextReport` accounting, and determinism.

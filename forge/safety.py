@@ -34,7 +34,9 @@ Every function that executes a shell command MUST call
 from __future__ import annotations
 
 import os
+import re
 import shlex
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from forge.logging import get_logger
@@ -315,6 +317,130 @@ def assert_safe_command(cmd: str | list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Secret handling: shell environment, output redaction, secret files
+# ---------------------------------------------------------------------------
+
+#: Environment variables a ``run_shell`` child process may inherit. Matched
+#: case-insensitively. Everything else (API keys included) is withheld.
+SHELL_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC",
+        "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES",
+        "PROGRAMFILES(X86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+        "OS", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL", "USER", "USERNAME",
+        "LOGNAME", "VIRTUAL_ENV", "PYTHONIOENCODING", "PYTHONUTF8",
+    }
+)
+
+_SECRET_NAME_RE = re.compile(
+    r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION",
+    re.IGNORECASE,
+)
+
+#: FORGE settings whose values are known not to be secret. Their values are
+#: NOT redacted from tool output: they routinely appear in legitimate output
+#: (the workspace path in tracebacks, the model name in source files) and
+#: redacting them would corrupt text that edit_file must match exactly.
+#: Any other FORGE_* value is treated as a potential secret.
+_NON_SECRET_FORGE_VARS: frozenset[str] = frozenset(
+    {
+        "FORGE_LLM_PROVIDER", "FORGE_LLM_MODEL", "FORGE_LLM_BASE_URL",
+        "FORGE_PROVIDER_ORDER", "FORGE_PROVIDER_RETRY_MAX",
+        "FORGE_LLM_REQUEST_TIMEOUT_S", "FORGE_LLM_TEMPERATURE",
+        "FORGE_LLM_MAX_OUTPUT_TOKENS", "FORGE_MAX_TOOL_CALLS",
+        "FORGE_MAX_LLM_TURNS", "FORGE_WORKSPACE_ROOT", "FORGE_LOG_LEVEL",
+        "FORGE_LOG_FORMAT", "FORGE_LOG_DIR", "FORGE_SHELL_ENV_ALLOW",
+    }
+)
+
+REDACTED = "***REDACTED***"
+_MIN_SECRET_LEN = 8
+
+
+def is_secret_env_name(name: str) -> bool:
+    """True if an env var *name* looks like it holds a secret."""
+    return bool(_SECRET_NAME_RE.search(name))
+
+
+def build_shell_env(
+    extra_allow: Iterable[str] = (),
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the minimal environment for a ``run_shell`` child process.
+
+    Rules (names compared case-insensitively):
+    - ``FORGE_*`` variables are never passed.
+    - Names listed in *extra_allow* (``FORGE_SHELL_ENV_ALLOW``) are passed,
+      even if they look like secrets — that is the explicit opt-in.
+    - Otherwise a name must be on ``SHELL_ENV_ALLOWLIST`` and must not
+      match the secret-name pattern.
+    """
+    source = os.environ if environ is None else environ
+    opted_in = {n.strip().upper() for n in extra_allow if n and n.strip()}
+    env: dict[str, str] = {}
+    for name, value in source.items():
+        upper = name.upper()
+        if upper.startswith("FORGE_"):
+            continue
+        if upper in opted_in:
+            env[name] = value
+        elif upper in SHELL_ENV_ALLOWLIST and not is_secret_env_name(upper):
+            env[name] = value
+    return env
+
+
+def collect_secret_values(environ: Mapping[str, str] | None = None) -> list[str]:
+    """Values (>= 8 chars) of env vars that may hold secrets, longest first.
+
+    A variable counts as secret if its name matches the secret pattern, or
+    it is a ``FORGE_*`` variable that is not a known non-secret setting.
+    """
+    source = os.environ if environ is None else environ
+    values: set[str] = set()
+    for name, value in source.items():
+        upper = name.upper()
+        if not value or len(value) < _MIN_SECRET_LEN:
+            continue
+        if is_secret_env_name(upper) or (
+            upper.startswith("FORGE_") and upper not in _NON_SECRET_FORGE_VARS
+        ):
+            values.add(value)
+    return sorted(values, key=len, reverse=True)
+
+
+def redact_secrets(text: str, secrets: Iterable[str] | None = None) -> str:
+    """Replace every occurrence of a secret value in *text* with REDACTED."""
+    if not text:
+        return text
+    for value in collect_secret_values() if secrets is None else secrets:
+        if value in text:
+            text = text.replace(value, REDACTED)
+    return text
+
+
+def is_secret_file(path: Path | str) -> bool:
+    """True if *path*'s basename is a secret file FORGE tools must not touch.
+
+    Blocked: ``.env`` and ``.env.*`` (except ``.env.example``), ``*.pem``,
+    ``*.key``, ``id_rsa*``, ``id_ed25519*``.
+    """
+    name = Path(path).name.lower()
+    if name == ".env.example":
+        return False
+    if name == ".env" or name.startswith(".env."):
+        return True
+    if name.endswith((".pem", ".key")):
+        return True
+    return name.startswith(("id_rsa", "id_ed25519"))
+
+
+def secret_file_error(path: Path | str) -> str:
+    """Error text (without the ``ERROR:`` prefix) for a blocked secret file."""
+    return f"access to secret file '{Path(path).name}' is blocked by FORGE"
+
+
+# ---------------------------------------------------------------------------
 # Convenience summary
 # ---------------------------------------------------------------------------
 
@@ -333,7 +459,11 @@ FORGE Safety Boundaries (Step 1)
    This is a heuristic, NOT a full sandbox.
 
 4. SECRETS — API keys are never written to disk or logged. All secrets
-   must arrive via environment variables.
+   must arrive via environment variables. run_shell children get a minimal
+   allowlisted environment (no FORGE_* or secret-named variables unless
+   opted in via FORGE_SHELL_ENV_ALLOW), stdin is closed, secret values are
+   redacted from tool output, and secret files (.env, *.pem, ...) are
+   blocked for read_file / edit_file / write_file.
 
 5. NOT YET ENFORCED:
    - subprocess sandboxing / seccomp

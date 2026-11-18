@@ -25,7 +25,8 @@ systems, RAG/vector stores, and cloud infrastructure.
 
 Step 2 delivers the **first working agent loop**:
 
-- **Gemini provider adapter** (`google-genai`) behind a provider-agnostic
+- **OpenAI-compatible provider adapter** (standard library only; default
+  preset: OpenCode Go with `deepseek-v4.1-flash`) behind a provider-agnostic
   `LLMProvider` interface.
 - **Five built-in tools**: `read_file`, `write_file`, `edit_file`,
   `list_directory`, `run_shell` — all routed through the workspace-safety
@@ -42,8 +43,8 @@ Step 2 delivers the **first working agent loop**:
   compare runs.
 - **CLI**: `forge run --task "..."`.
 
-The real Gemini API demo is **pending API-key setup** (see below); the loop is
-fully covered by mocked tests including a mocked end-to-end run.
+A real run needs an OpenCode Go API key (see below); the loop is fully
+covered by mocked tests including a mocked end-to-end run.
 
 ## Setup
 
@@ -59,20 +60,25 @@ pip install -e ".[dev]"
 cp .env.example .env          # then edit .env
 ```
 
-## Gemini configuration
+## Provider configuration (OpenCode Go)
 
 FORGE reads all configuration from the environment (`.env` is loaded
-automatically).
+automatically). It talks to any OpenAI-compatible `/chat/completions`
+endpoint; the default preset is OpenCode Go.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FORGE_LLM_PROVIDER` | `gemini` | Provider id. Only `gemini` has an adapter today. |
-| `FORGE_LLM_MODEL` | `gemini-3.6-flash` | Model name passed to the Gemini API. |
-| `FORGE_LLM_API_KEY` | — | Gemini API key. Falls back to `GEMINI_API_KEY` / `GOOGLE_API_KEY`. |
+| `FORGE_LLM_PROVIDER` | `opencode_go` | `opencode_go` (OpenCode Go preset) or `openai_compatible` (any OpenAI-compatible endpoint, e.g. Ollama at `http://localhost:11434/v1`). |
+| `FORGE_LLM_MODEL` | `deepseek-v4.1-flash` | Model name sent to the endpoint. |
+| `FORGE_LLM_API_KEY` | — | API key. For `opencode_go` it falls back to `OPENCODE_API_KEY`. |
+| `FORGE_LLM_BASE_URL` | `https://opencode.ai/zen/go/v1` for `opencode_go` | Endpoint base URL. Required for `openai_compatible`. |
+| `FORGE_LLM_REQUEST_TIMEOUT_S` | `120` | Per-request timeout in seconds. |
+| `FORGE_PROVIDER_RETRY_MAX` | `3` | Retries for transient errors (429, 408, 5xx, connection errors). |
+| `FORGE_SHELL_ENV_ALLOW` | — | Extra env var names passed to `run_shell` commands (`FORGE_*` never is). |
 | `FORGE_LLM_TEMPERATURE` | `0.0` | Sampling temperature (0.0–2.0). |
-| `FORGE_LLM_MAX_OUTPUT_TOKENS` | `4096` | Max output tokens per call. |
-| `FORGE_MAX_LLM_TURNS` | `30` | Hard ceiling on LLM turns per run. |
-| `FORGE_MAX_TOOL_CALLS` | `50` | Hard ceiling on tool calls per run. |
+| `FORGE_LLM_MAX_OUTPUT_TOKENS` | `0` | Max output tokens per call. `0` = no cap. |
+| `FORGE_MAX_LLM_TURNS` | `30` | Hard ceiling on LLM turns per run. `0` = unlimited. |
+| `FORGE_MAX_TOOL_CALLS` | `50` | Hard ceiling on tool calls per run. `0` = unlimited. |
 | `FORGE_WORKSPACE_ROOT` | cwd | All file/shell operations are confined here. |
 | `FORGE_LOG_DIR` | `logs` | Where run traces (`<run_id>.jsonl`) are written. |
 
@@ -107,7 +113,7 @@ error) · `2` configuration problem (e.g. no API key).
 User task
   → AgentRuntime (forge.agent)            owns the loop + hard limits
       → ContextStrategy (forge.context)   Step 2: RawContextStrategy
-      → LLMProvider (forge.llm)           → GeminiProvider (forge.providers.gemini)
+      → LLMProvider (forge.llm)           → OpenAICompatibleProvider (forge.providers.openai_compat)
       → ToolExposureStrategy (forge.tools) Step 2: FixedToolExposure
       → ToolRegistry → built-in tools (forge.builtin_tools)
       → safety guards (forge.safety)
@@ -117,7 +123,7 @@ User task
 
 Nothing outside `forge/providers/` imports a provider SDK. The agent depends
 on the `LLMProvider`, `ContextStrategy`, and `ToolExposureStrategy`
-abstractions, never on Gemini or on adaptive behaviour. See
+abstractions, never on a specific provider or on adaptive behaviour. See
 [`docs/architecture.md`](docs/architecture.md) and
 [`docs/step-02-agent-loop.md`](docs/step-02-agent-loop.md).
 
@@ -133,6 +139,11 @@ The safety layer is a **heuristic, not a sandbox**:
 - It does **not** stop shell wrappers (`sh -c "rm ..."`), interpreter
   one-liners, output redirection, or network access from within an allowed
   program. Run FORGE against disposable workspaces.
+- `run_shell` commands get a minimal allowlisted environment (no API keys,
+  no `FORGE_*` variables), closed stdin, and secret values are redacted from
+  tool output. `read_file` / `edit_file` / `write_file` refuse `.env`,
+  `*.pem`, `*.key` and SSH key files. This reduces accidental key leaks; it
+  is still not a sandbox.
 
 ## Tests
 
@@ -140,7 +151,7 @@ The safety layer is a **heuristic, not a sandbox**:
 pytest            # 214 tests, no API key required
 ```
 
-Coverage: Gemini adapter (mocked SDK), the five tools + their safety and
+Coverage: OpenAI-compatible adapter (fake transport), the five tools + their safety and
 error paths, tool registry, config validation, logging, context + strategy,
 observability + token accounting, and the agent loop — malformed / unknown /
 failing tool calls, provider errors, `max_llm_turns` / `max_tool_calls`
@@ -150,7 +161,7 @@ ceilings, and a mocked end-to-end two-step coding task.
 
 | Area | Change |
 |---|---|
-| Provider | New `forge/providers/gemini.py` (`google-genai`); `get_provider()` wired for `gemini`. |
+| Provider | First provider adapter + `get_provider()` factory (the original adapter has since been replaced by `forge/providers/openai_compat.py`). |
 | LLM types | `LLMResponse` gains `tool_calls`, `cached_input_tokens`, `reasoning_tokens`, `total_tokens`, `model`, `raw_usage`; new `ToolCall`; `Message` gains tool fields; new `LLMError`. |
 | Tools | New `forge/builtin_tools.py` with the five tools + `build_default_registry()`. |
 | Strategies | `ContextStrategy`/`RawContextStrategy` (context.py); `ToolExposureStrategy`/`FixedToolExposure` (tools.py). |
@@ -159,7 +170,7 @@ ceilings, and a mocked end-to-end two-step coding task.
 | CLI | New `forge/cli.py`; `forge` console script. |
 | Observability | `RunTracer` records experiment metadata + `llm_call`/`llm_response` split; token accounting is `None`-safe with independent input/output availability. |
 | Audit fixes | `.rstrip(".exe")` → real suffix strip; Windows-safe command splitting; negative/out-of-range config values rejected; token fields default `None` not `0`; architecture doc corrected. |
-| Deps | Added `google-genai` (lazy-imported, confined to the adapter). |
+| Deps | Provider SDK dependency added at the time; since removed (the current adapter uses only the standard library). |
 
 ## Intentionally not implemented
 
@@ -173,7 +184,7 @@ ceilings, and a mocked end-to-end two-step coding task.
 
 ## Next step (Step 3)
 
-Run the first real Gemini task once a key is configured, then start the
+Run the first real task once a key is configured, then start the
 **evaluation harness**: a task runner that executes the same task under
 different harness strategies and aggregates the per-run JSONL traces into a
 comparison table (task success, tokens, cost, latency, LLM/tool calls,

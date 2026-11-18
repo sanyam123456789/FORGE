@@ -60,7 +60,7 @@ The diagram below shows the same flow with the research seams marked.
 ┌─────────────────────────────────────────────────────────────┐
 │             LLM Provider Interface (forge.llm)              │
 │  Normalised: Message / ToolCall → LLMResponse + usage      │
-│  Adapters (forge.providers): gemini  [openai | anthropic …] │
+│  Adapters (forge.providers): openai_compat (opencode_go …)   │
 └──────┬──────────────────────────────────────────────────────┘
        │ tool schemas
        │ ┌──────────────────────────────────────────────────────┐
@@ -98,7 +98,7 @@ The diagram below shows the same flow with the research seams marked.
 | `forge.logging` | Initialise the forge.* logging hierarchy. Text and JSON formatters. |
 | `forge.safety` | Enforce workspace boundaries and command restrictions before any file/shell operation. |
 | `forge.llm` | Provider-agnostic vocabulary (`Message`, `ToolCall`, `LLMResponse`, `LLMError`), the `LLMProvider` ABC, and `get_provider()`. |
-| `forge.providers` | Concrete adapters. `forge.providers.gemini` is the only one so far; nothing else imports a provider SDK. |
+| `forge.providers` | Concrete adapters. `forge.providers.openai_compat` (presets `opencode_go`, `openai_compatible`; standard library only) plus the provider-agnostic `fallback`. Nothing else talks to a provider API. |
 | `forge.tools` | `Tool` ABC, `ToolRegistry` (`get_schemas(subset)` = exposure hook), and the `ToolExposureStrategy` seam (`FixedToolExposure`, `AdaptiveToolExposure` — Step 5). |
 | `forge.builtin_tools` | The five concrete tools + `build_default_registry()`. |
 | `forge.context` | `ConversationContext` history container + the `ContextStrategy` seam (`RawContextStrategy`, `ManagedContextStrategy` — Step 6) and `ContextReport` measurement. |
@@ -247,7 +247,7 @@ against disposable workspaces.
 | JSONL trace files | Human-readable, easily parsed with `jq` or pandas. No database required. |
 | Frozen `ForgeSettings` dataclass | Prevents accidental mutation of config after startup. |
 | No subprocess sandbox yet | The safety layer is a documented heuristic; a real sandbox is out of scope for the research questions. |
-| Gemini as the first provider (Step 2) | Current, non-permanent choice. Confined to `forge/providers/gemini.py`; `google-genai` is lazy-imported. The rest of FORGE only sees `forge.llm` types. |
+| OpenAI-compatible provider (OpenCode Go default) | One stdlib-only adapter (`forge/providers/openai_compat.py`) covers OpenCode Go, OpenAI, OpenRouter and local Ollama. It replaced the earlier Gemini/Groq/Cerebras SDK adapters. The rest of FORGE only sees `forge.llm` types. |
 | Strategy *objects* for the research arms | `ToolExposureStrategy` / `ContextStrategy` are injected into `AgentRuntime`. Swapping Fixed→Adaptive or Raw→Managed later needs no change to the loop, and the strategy id is recorded in every trace. |
 | `None` ≠ `0` for usage | A metric a provider does not report is recorded as `None`; input and output availability are tracked independently so a real zero is never invented. |
 | Keyword-based classifier for `AdaptiveToolExposure` (Step 5) | Deterministic, explainable, and dependency-free — no embeddings/ML model needed to compare Fixed vs. Adaptive. Deliberately a placeholder: a learned or per-turn selector can replace it later without touching `AgentRuntime`, `ExperimentConfig`, or the tracer. |

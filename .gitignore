@@ -73,3 +73,10 @@ forge_run_*/
 # ----- Build Artifacts --------------------------------------
 *.pyc
 *.pyo
+
+# ----- Local demo / video / scratch output ---------------------
+Claude outputs/
+brag-output/
+viva-demo-output/
+scratch-run/
+.forge/

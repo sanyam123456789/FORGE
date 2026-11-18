@@ -1,7 +1,7 @@
 """
 Tests for forge.evaluation.matrix — the Step 7 formal 2x2 controlled experiment.
 
-No real Gemini call: every task-arm execution gets its own scripted fake
+No real LLM call: every task-arm execution gets its own scripted fake
 ``LLMProvider`` (via a ``provider_factory``) driving the *real*
 ``AgentRuntime``/``EvaluationRunner`` with the real built-in tools in a fresh
 tmp workspace per (task, arm) pair.
@@ -67,8 +67,8 @@ class ScriptedProvider(LLMProvider):
 
 
 _SETTINGS = SimpleNamespace(
-    llm_provider="gemini",
-    llm_model="gemini-3.6-flash",
+    llm_provider="opencode_go",
+    llm_model="deepseek-v4.1-flash",
     llm_temperature=0.0,
     llm_max_output_tokens=4096,
     max_llm_turns=30,
@@ -482,7 +482,7 @@ def test_arms_actually_resolve_to_distinct_strategy_objects():
         from forge.evaluation.experiment import ExperimentConfig
 
         cfg = ExperimentConfig(
-            task_id="x", provider="gemini", model="m",
+            task_id="x", provider="opencode_go", model="m",
             tool_strategy=arm.tool_strategy, context_strategy=arm.context_strategy,
         )
         tool_strat, ctx_strat = cfg.resolve_strategies()

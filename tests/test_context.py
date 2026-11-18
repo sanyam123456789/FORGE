@@ -382,3 +382,273 @@ class TestManagedContextStrategyLongHistory:
         }
         tool_result_ids = {m.tool_call_id for m in prepared if m.role == "tool"}
         assert tool_call_ids == tool_result_ids
+
+
+# ---------------------------------------------------------------------------
+# Per-resource retention (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+def _pad(text: str) -> str:
+    """Make content long enough that compression actually shrinks it."""
+    return text + " " + ("payload " * 20)
+
+
+def _turns_ctx(turns) -> ConversationContext:
+    """Build a context from explicit turns.
+
+    *turns* is a list of turns; each turn is a list of
+    (tool_name, arguments, result_content, call_id) tuples, one per call.
+    """
+    ctx = ConversationContext()
+    ctx.add_message(Message(role="system", content="You are FORGE."))
+    ctx.add_message(Message(role="user", content="the task"))
+    for t, calls in enumerate(turns):
+        ctx.add_message(
+            Message(
+                role="assistant",
+                content=f"turn {t}: " + ("thinking " * 10),
+                tool_calls=[
+                    ToolCall(id=cid, name=name, arguments=args)
+                    for name, args, _content, cid in calls
+                ],
+            )
+        )
+        for name, _args, content, cid in calls:
+            ctx.add_message(
+                Message(role="tool", content=content, name=name, tool_call_id=cid)
+            )
+    return ctx
+
+
+def _read(path, content, cid=None, t=0):
+    return ("read_file", {"path": path}, _pad(content), cid if cid is not None else f"r{t}")
+
+
+def _shell(cmd, content, cid, exit_code=0):
+    return ("run_shell", {"command": cmd}, _pad(content) + f"\n[exit code {exit_code}]", cid)
+
+
+def _filler(n, start=0):
+    """n distinct shell turns (distinct commands, so none supersede)."""
+    return [
+        [_shell(f"python step{start + k}.py", f"step {start + k} ok", f"f{start + k}")]
+        for k in range(n)
+    ]
+
+
+def _tool_contents(prepared):
+    return [m.content for m in prepared if m.role == "tool"]
+
+
+class TestManagedContextPerResource:
+    def test_different_files_both_kept_outside_recent_window(self):
+        turns = [[_read("a.py", "A-CONTENT", t=0)], [_read("b.py", "B-CONTENT", t=1)]]
+        turns += _filler(4)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert any(c.startswith("A-CONTENT") for c in contents)
+        assert any(c.startswith("B-CONTENT") for c in contents)
+
+    def test_same_file_twice_older_compressed_with_named_marker(self):
+        turns = [
+            [_read("a.py", "A-OLD", t=0)],
+            [_read("b.py", "B", t=1)],
+            [_read("a.py", "A-NEW", t=2)],
+        ]
+        turns += _filler(3)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        old_len = len(_pad("A-OLD"))
+        assert contents[0] == (
+            f"[MANAGED CONTEXT: older read of 'a.py' omitted ({old_len} chars) "
+            "— superseded by a later read; call read_file again if needed]"
+        )
+        assert not any(c.startswith("A-OLD") for c in contents)
+        assert contents[1].startswith("B ")
+        assert contents[2].startswith("A-NEW")
+
+    def test_shell_commands_keyed_by_command(self):
+        turns = [
+            [_shell("python -m pytest -q", "first test run", "s0")],
+            [_shell("python lint.py", "lint run", "s1")],
+            [_shell("python  -m   pytest -q", "second test run", "s2")],
+        ]
+        turns += _filler(3)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith(
+            "[MANAGED CONTEXT: older output of 'python -m pytest -q' omitted ("
+        )
+        assert contents[0].endswith("chars) — a later run exists]")
+        assert contents[1].startswith("lint run")
+        assert contents[2].startswith("second test run")
+
+    def test_duplicate_call_ids_across_turns_paired_within_turn(self):
+        turns = [
+            [_read("a.py", "A-OLD", cid="call_0")],
+            [_read("b.py", "B", cid="call_0")],
+            [_read("a.py", "A-NEW", cid="call_0")],
+        ]
+        turns += [
+            [_shell(f"python s{k}.py", f"s{k}", "call_0")] for k in range(3)
+        ]
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("[MANAGED CONTEXT: older read of 'a.py'")
+        assert contents[1].startswith("B ")
+        assert contents[2].startswith("A-NEW")
+
+    def test_duplicate_ids_within_one_turn_fall_back_to_position(self):
+        turns = [
+            [_read("x.py", "X-OLD", cid="call_0"), _read("y.py", "Y", cid="call_0")],
+            [_read("x.py", "X-NEW", cid="call_0")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("[MANAGED CONTEXT: older read of 'x.py'")
+        assert contents[1].startswith("Y ")
+        assert contents[2].startswith("X-NEW")
+
+    def test_missing_result_ids_paired_by_position(self):
+        turns = [
+            [_read("a.py", "A-OLD", cid=""), _read("b.py", "B", cid="")],
+            [_read("a.py", "A-NEW", cid="")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("[MANAGED CONTEXT: older read of 'a.py'")
+        assert contents[1].startswith("B ")
+
+    def test_path_spellings_share_one_key(self):
+        turns = [
+            [_read("src\\app.py", "APP-OLD", t=0)],
+            [_read("./src/app.py", "APP-NEW", t=1)],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("[MANAGED CONTEXT: older read of 'src\\app.py'")
+        assert contents[1].startswith("APP-NEW")
+
+    def test_path_normalization(self):
+        from forge.context import _normalize_path
+
+        assert _normalize_path("src\\app.py") == _normalize_path("./src/app.py")
+        assert _normalize_path("src/../src/app.py") == _normalize_path("src/app.py")
+        assert _normalize_path(".") == "."
+
+    def test_writes_never_supersede_reads(self):
+        turns = [
+            [_read("a.py", "A-CONTENT", t=0)],
+            [("edit_file", {"path": "a.py", "old_string": "x", "new_string": "y"},
+              _pad("Edited a.py"), "e1")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("A-CONTENT")
+        assert contents[1].startswith("Edited a.py")
+
+    def test_repeated_writes_supersede_each_other(self):
+        turns = [
+            [("write_file", {"path": "a.py", "content": "1"}, _pad("Created a.py"), "w0")],
+            [("edit_file", {"path": "a.py", "old_string": "1", "new_string": "2"},
+              _pad("Edited a.py"), "w1")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith(
+            "[MANAGED CONTEXT: older write_file result for 'a.py'"
+        )
+        assert contents[1].startswith("Edited a.py")
+
+    def test_list_directory_default_path_is_dot(self):
+        turns = [
+            [("list_directory", {}, _pad("OLD-LISTING"), "l0")],
+            [("list_directory", {"path": "."}, _pad("NEW-LISTING"), "l1")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("[MANAGED CONTEXT: older listing of '.'")
+        assert contents[1].startswith("NEW-LISTING")
+
+    def test_unknown_tools_never_collapsed(self):
+        turns = [
+            [("grep_tool", {"pattern": "x"}, _pad("GREP-1"), "g0")],
+            [("grep_tool", {"pattern": "x"}, _pad("GREP-2"), "g1")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("GREP-1")
+        assert contents[1].startswith("GREP-2")
+
+    def test_error_and_recent_turns_never_compressed(self):
+        turns = [
+            [_read("a.py", "A-OLD", t=0)],
+            [("read_file", {"path": "a.py"}, "ERROR: file not found: a.py", "r1")],
+            [_read("a.py", "A-MID", t=2)],
+            [_read("a.py", "A-RECENT", t=3)],
+        ]
+        strategy = ManagedContextStrategy(keep_recent_turns=1)
+        prepared = strategy.prepare(_turns_ctx(turns))
+        contents = _tool_contents(prepared)
+        assert contents[0].startswith("[MANAGED CONTEXT: older read of 'a.py'")
+        assert contents[1] == "ERROR: file not found: a.py"  # error turn in full
+        assert contents[2].startswith("A-MID")  # latest non-protected read
+        assert contents[3].startswith("A-RECENT")  # recent window
+        assistants = [m.content for m in prepared if m.role == "assistant"]
+        assert assistants[1].startswith("turn 1:")  # error turn text kept
+        assert assistants[3].startswith("turn 3:")  # recent turn text kept
+        assert strategy.last_report().turns_kept_error == 1
+
+    def test_budget_still_drops_oldest_unprotected_turns(self):
+        turns = [[_read(f"f{t}.py", f"F{t}", t=t)] for t in range(10)]
+        strategy = ManagedContextStrategy(
+            keep_recent_turns=2, max_messages=10, max_chars=1_000_000
+        )
+        prepared = strategy.prepare(_turns_ctx(turns))
+        report = strategy.last_report()
+        assert len(prepared) <= 10
+        assert report.turns_dropped_for_budget == 6
+        assert [c.split(" ")[0] for c in _tool_contents(prepared)] == [
+            "F6", "F7", "F8", "F9"
+        ]
+
+    def test_tool_call_never_separated_from_result(self):
+        turns = []
+        for t in range(12):
+            turns.append([
+                _read(f"m{t % 3}.py", f"M{t}", cid="call_0"),
+                _shell("python -m pytest -q", f"run {t}", "call_1"),
+            ])
+        strategy = ManagedContextStrategy(keep_recent_turns=3, max_messages=15, max_chars=3000)
+        prepared = strategy.prepare(_turns_ctx(turns))
+        for idx, m in enumerate(prepared):
+            if m.role == "assistant":
+                results = prepared[idx + 1: idx + 1 + len(m.tool_calls)]
+                assert [r.role for r in results] == ["tool"] * len(m.tool_calls)
+                assert [r.name for r in results] == [c.name for c in m.tool_calls]
+        assert sum(1 for m in prepared if m.role == "tool") == 2 * sum(
+            1 for m in prepared if m.role == "assistant"
+        )
+
+    def test_per_resource_deterministic(self):
+        turns = [[_read(f"m{t % 3}.py", f"M{t}", t=t)] for t in range(9)]
+        out_a = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        out_b = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        assert [(m.role, m.content) for m in out_a] == [(m.role, m.content) for m in out_b]
+
+    def test_compression_never_grows_a_message(self):
+        turns = [
+            [("read_file", {"path": "a.py"}, "tiny", "r0")],
+            [("read_file", {"path": "a.py"}, "tiny2", "r1")],
+        ]
+        turns += _filler(2)
+        prepared = ManagedContextStrategy(keep_recent_turns=2).prepare(_turns_ctx(turns))
+        assert _tool_contents(prepared)[0] == "tiny"

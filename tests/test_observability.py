@@ -52,8 +52,8 @@ class TestRunTracer:
 
     def test_record_run_start_captures_experiment_metadata(self, tracer):
         tracer.record_run_start(
-            provider="gemini",
-            model="gemini-3.6-flash",
+            provider="opencode_go",
+            model="deepseek-v4.1-flash",
             temperature=0.0,
             max_output_tokens=4096,
             system_prompt_id="sha256:abc123",
@@ -64,8 +64,8 @@ class TestRunTracer:
         assert len(tracer._events) == 1
         event = tracer._events[0]
         assert event.event_type == RUN_START
-        assert event.data["provider"] == "gemini"
-        assert event.data["model"] == "gemini-3.6-flash"
+        assert event.data["provider"] == "opencode_go"
+        assert event.data["model"] == "deepseek-v4.1-flash"
         assert event.data["system_prompt_id"] == "sha256:abc123"
         assert event.data["tool_exposure_strategy"] == "fixed"
         assert event.data["context_strategy"] == "raw"
@@ -194,7 +194,7 @@ class TestRunTracer:
         assert tracer._events[0].event_type == ERROR
 
     def test_record_run_end(self, tracer):
-        tracer.record_run_start(provider="gemini", model="m")
+        tracer.record_run_start(provider="opencode_go", model="m")
         tracer.record_llm_response(input_tokens=10, output_tokens=4)
         tracer.record_run_end(status="completed", final_answer="Done.")
         end = tracer._events[-1]
@@ -205,12 +205,12 @@ class TestRunTracer:
         assert end.data["elapsed_ms"] is not None
 
     def test_summary_reflects_none_when_no_tokens(self, tracer):
-        tracer.record_run_start(provider="gemini", model="m")
+        tracer.record_run_start(provider="opencode_go", model="m")
         summary = tracer.summary(status="completed")
         assert summary.input_tokens is None
         assert summary.output_tokens is None
         assert summary.total_tokens is None
-        assert summary.provider == "gemini"
+        assert summary.provider == "opencode_go"
 
     def test_summary_reflects_tokens_when_present(self, tracer):
         tracer.record_llm_response(input_tokens=500, output_tokens=200)
@@ -220,7 +220,7 @@ class TestRunTracer:
         assert summary.total_tokens == 700
 
     def test_flush_creates_valid_jsonl(self, tracer, tmp_path):
-        tracer.record_run_start(provider="gemini", model="m")
+        tracer.record_run_start(provider="opencode_go", model="m")
         tracer.record_llm_request(turn=1, message_count=2, exposed_tools=[])
         tracer.record_llm_response(input_tokens=100, output_tokens=40)
         tracer.record_run_end(status="completed")

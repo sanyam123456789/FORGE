@@ -2,7 +2,7 @@
 forge.providers.fallback — provider-agnostic ordered fallback.
 
 ``FallbackProvider`` composes an ordered list of concrete ``LLMProvider``
-adapters (e.g. gemini -> groq -> cerebras) and itself implements
+adapters (e.g. opencode_go -> openai_compatible) and itself implements
 ``LLMProvider``, so nothing outside ``forge/providers/`` needs to change:
 ``AgentRuntime`` calls ``provider.complete()`` exactly as it always has and
 has no idea whether a fallback happened underneath.
@@ -26,8 +26,8 @@ Fallback rules (see docs on ``complete()`` for the full decision table):
 - Each candidate is tried at most once per ``complete()`` call: bounded,
   no cross-provider retry loops. (Each adapter still does its own small
   internal retry for transient errors before giving up and letting
-  FallbackProvider move on — see forge/providers/gemini.py, groq.py,
-  cerebras.py. This is intentionally the only retry layer; FallbackProvider
+  FallbackProvider move on — see forge/providers/openai_compat.py.
+  This is intentionally the only retry layer; FallbackProvider
   itself never retries a candidate.)
 
 Run-scoped stickiness
@@ -129,7 +129,7 @@ class FallbackProvider(LLMProvider):
         messages: list[Message],
         *,
         tools: list[dict] | None = None,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         temperature: float = 0.0,
     ) -> LLMResponse:
         failures: list[str] = []

@@ -82,7 +82,7 @@ class ExperimentConfig:
     tool_strategy: str = TOOL_STRATEGY_FIXED
     context_strategy: str = CONTEXT_STRATEGY_RAW
     temperature: float = 0.0
-    max_output_tokens: int = 4096
+    max_output_tokens: int = 0  # 0 = no cap
     max_llm_turns: int | None = None
     max_tool_calls: int | None = None
     run_id: str | None = None
@@ -178,7 +178,7 @@ class ExperimentConfig:
             tool_strategy=data.get("tool_strategy", TOOL_STRATEGY_FIXED),
             context_strategy=data.get("context_strategy", CONTEXT_STRATEGY_RAW),
             temperature=data.get("temperature", 0.0),
-            max_output_tokens=data.get("max_output_tokens", 4096),
+            max_output_tokens=data.get("max_output_tokens", 0),
             max_llm_turns=data.get("max_llm_turns"),
             max_tool_calls=data.get("max_tool_calls"),
             run_id=data.get("run_id"),

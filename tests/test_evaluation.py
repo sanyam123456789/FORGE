@@ -1,7 +1,7 @@
 """
 Tests for forge.evaluation — the Step 3 measurement layer.
 
-No real Gemini call: a scripted fake ``LLMProvider`` drives the *real*
+No real LLM call: a scripted fake ``LLMProvider`` drives the *real*
 ``AgentRuntime`` with the real built-in tools in a tmp workspace.  These
 tests exercise task representation, experiment configuration, the runner,
 result serialisation, and None-safe aggregation.
@@ -88,8 +88,8 @@ def _write_calc_then_done(**usage):
 
 
 _SETTINGS = SimpleNamespace(
-    llm_provider="gemini",
-    llm_model="gemini-3.6-flash",
+    llm_provider="opencode_go",
+    llm_model="deepseek-v4.1-flash",
     llm_temperature=0.0,
     llm_max_output_tokens=4096,
     max_llm_turns=30,
@@ -183,8 +183,8 @@ class TestExperimentConfig:
 
     def test_from_settings_pulls_provider_model_and_params(self):
         exp = _experiment()
-        assert exp.provider == "gemini"
-        assert exp.model == "gemini-3.6-flash"
+        assert exp.provider == "opencode_go"
+        assert exp.model == "deepseek-v4.1-flash"
         assert exp.temperature == 0.0
         assert exp.max_output_tokens == 4096
         assert exp.max_llm_turns == 30
@@ -475,7 +475,7 @@ class TestEvaluationRunner:
 
 def _mk_result(**overrides) -> EvalResult:
     base = dict(
-        task_id="t", run_id="run_x", provider="gemini", model="gemini-3.6-flash",
+        task_id="t", run_id="run_x", provider="opencode_go", model="deepseek-v4.1-flash",
         tool_strategy="fixed", context_strategy="raw", status="completed", success=True,
         input_tokens=100, output_tokens=20, total_tokens=120, latency_ms=1234.5,
         llm_calls=2, tool_calls=1,
@@ -607,7 +607,7 @@ class TestAggregation:
         agg = aggregate_results(results)
         assert agg.tool_strategy == "fixed"
         assert agg.context_strategy == "raw"
-        assert agg.provider == "gemini"
+        assert agg.provider == "opencode_go"
 
         grouped = group_results(results)
         assert set(grouped) == {"fixed+raw"}

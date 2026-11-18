@@ -3,7 +3,7 @@ Tests for the Step 4 baseline task suite and its loader
 (``forge.evaluation.suite``) plus the small ``EvalTask`` extensions it uses
 (fixtures + richer ``ArtifactCheck``).
 
-No real Gemini call: the one end-to-end test drives the real ``AgentRuntime``
+No real LLM call: the one end-to-end test drives the real ``AgentRuntime``
 with a scripted fake provider and the real built-in tools in a tmp workspace.
 """
 
@@ -59,7 +59,7 @@ class TestBaselineSuite:
         assert len(ids) == len(set(ids)), "task_ids must be unique"
         # identity is a plain slug — no strategy / provider / model / run id
         for tid in ids:
-            for banned in ("fixed", "raw", "adaptive", "managed", "gemini", "run_"):
+            for banned in ("fixed", "raw", "adaptive", "managed", "opencode", "deepseek", "run_"):
                 assert banned not in tid
 
     def test_every_task_has_prompt_and_at_least_one_check(self):
@@ -372,8 +372,8 @@ class ScriptedProvider(LLMProvider):
 
 
 _SETTINGS = SimpleNamespace(
-    llm_provider="gemini",
-    llm_model="gemini-3.6-flash",
+    llm_provider="opencode_go",
+    llm_model="deepseek-v4.1-flash",
     llm_temperature=0.0,
     llm_max_output_tokens=4096,
     max_llm_turns=30,

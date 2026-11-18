@@ -3,7 +3,7 @@ Tests for forge.evaluation.analysis — Step 8 statistical analysis.
 
 All data here is synthetic ``EvalResult``/JSONL test fixture data, built by
 hand or via ``MatrixRunner`` with a scripted fake provider (never a real
-Gemini call). No network, no API key.
+LLM call). No network, no API key.
 """
 
 from __future__ import annotations

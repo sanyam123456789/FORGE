@@ -64,7 +64,7 @@ experiment options:
     --model / --max-turns / --max-tool-calls / --temperature / --no-trace / --json
 
     NOTE: with no provider override this calls the real configured LLM
-    provider (Gemini by default) once per task-arm execution — a full 4-arm
+    provider (OpenCode Go by default) once per task-arm execution — a full 4-arm
     run against the baseline suite is one real API call sequence per cell
     and will consume real quota. Use a small --task-id/--arm subset for a
     quick check; see docs/step-07-controlled-2x2-experiment.md for how to

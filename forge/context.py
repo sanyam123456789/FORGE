@@ -36,11 +36,13 @@ Design
 
 from __future__ import annotations
 
+import os
+import posixpath
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from forge.llm import Message
+from forge.llm import Message, ToolCall
 from forge.logging import get_logger
 
 logger = get_logger(__name__)
@@ -244,6 +246,95 @@ def _is_error_tool_message(message: Message) -> bool:
     return bool(match and match.group(1) != "0")
 
 
+# ---------------------------------------------------------------------------
+# Per-resource keys for ManagedContextStrategy
+# ---------------------------------------------------------------------------
+
+#: Built-in tools whose results get a resource key. A call to one of these
+#: with missing/unparseable arguments falls back to a per-tool-name key (the
+#: pre-Fix-3 "latest per tool" behaviour). Any other tool gets a unique key.
+_KEYED_TOOLS = frozenset(
+    {"read_file", "run_shell", "list_directory", "edit_file", "write_file"}
+)
+_LABEL_MAX = 80
+
+
+def _normalize_path(path: str) -> str:
+    """Normalize a workspace path so equivalent spellings share one key."""
+    norm = posixpath.normpath(path.replace("\\", "/"))
+    if norm.startswith("./"):
+        norm = norm[2:]
+    if os.name == "nt":
+        norm = norm.casefold()
+    return norm
+
+
+def _label(text: str) -> str:
+    return text if len(text) <= _LABEL_MAX else text[: _LABEL_MAX - 3] + "..."
+
+
+def _pair_tool_calls(turn: list[Message]) -> dict[int, ToolCall]:
+    """Map each tool message's index in *turn* to the call it answers.
+
+    Pairing is done WITHIN the turn only: tool_call_id values are not
+    unique across turns (some providers reuse "call_0" every turn). First
+    match by id inside this turn's assistant message, then fall back to
+    position order (AgentRuntime appends results in call order).
+    """
+    if not turn or turn[0].role != "assistant":
+        return {}
+    calls = list(turn[0].tool_calls)
+    tool_positions = [j for j, m in enumerate(turn) if m.role == "tool"]
+    used: set[int] = set()
+    paired: dict[int, ToolCall] = {}
+    for j in tool_positions:
+        call_id = turn[j].tool_call_id
+        if not call_id:
+            continue
+        for k, call in enumerate(calls):
+            if k not in used and call.id == call_id:
+                paired[j] = call
+                used.add(k)
+                break
+    remaining = [k for k in range(len(calls)) if k not in used]
+    for j in tool_positions:
+        if j not in paired and remaining:
+            paired[j] = calls[remaining.pop(0)]
+    return paired
+
+
+def _resource_key(
+    message: Message, call: ToolCall | None, position: tuple[int, int]
+) -> tuple[tuple, str]:
+    """Return (key, label) for a tool-result message.
+
+    Results sharing a key supersede each other (only the latest is kept in
+    full); the label names the resource in the compression marker.
+    """
+    name = message.name or (call.name if call else "") or ""
+    if name not in _KEYED_TOOLS:
+        return ("unique", position), name
+    legacy = (("tool", name), name)
+    args = call.arguments if call is not None else None
+    if not isinstance(args, dict):
+        return legacy
+
+    if name == "run_shell":
+        command = args.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return legacy
+        collapsed = " ".join(command.split())
+        return ("shell", collapsed), _label(collapsed)
+
+    path = args.get("path")
+    if name == "list_directory" and path in (None, ""):
+        path = "."
+    if not isinstance(path, str) or not path:
+        return legacy
+    kind = {"read_file": "file", "list_directory": "dir"}.get(name, "write")
+    return (kind, _normalize_path(path)), _label(path)
+
+
 class ManagedContextStrategy(ContextStrategy):
     """Deterministic, rule-based context pruning/compression (Step 6).
 
@@ -268,14 +359,27 @@ class ManagedContextStrategy(ContextStrategy):
     4. Any older turn containing a failed tool result (see
        ``_is_error_tool_message``) is **always kept in full** — errors and
        test failures are never pruned or compressed.
-    5. Among the remaining (older, non-error) turns, for each tool name the
-       single most recent successful call's result is kept in full (the
-       "latest relevant tool result"); every other older successful result
-       for that tool, and the assistant text explaining a stale turn, is
-       replaced with a short placeholder ("compressed") — the message stays
-       in place (so tool-call/result pairing is never broken), only its
-       content shrinks. Compression never makes a message *larger*: content
-       already shorter than its own placeholder marker is left unchanged.
+    5. **Per-resource retention.** Among the remaining (older, non-error)
+       turns, each tool result gets a *resource key* from the matching
+       tool call in the same turn: ``read_file`` -> the file path,
+       ``run_shell`` -> the command (whitespace collapsed),
+       ``list_directory`` -> the directory, ``edit_file``/``write_file`` ->
+       the written path (a separate namespace, so writes never drop
+       reads). Paths are normalized (``\\`` -> ``/``, ``normpath``, no
+       leading ``./``, case-folded on Windows). For each key the single most
+       recent successful result is kept in full; older results with the
+       same key are superseded and replaced with a marker naming the
+       resource. Results with different keys are all kept (reading
+       ``app.py`` then ``database.py`` keeps both). A built-in tool call
+       with missing/unparseable arguments falls back to a per-tool-name key
+       (the original Step 6 rule); any other tool gets a unique key and is
+       never collapsed. Results are paired with calls *within* each turn
+       (by ``tool_call_id``, then by position), because ids may repeat
+       across turns. The assistant text of a stale turn is compressed too.
+       Compressed messages stay in place (tool-call/result pairing is never
+       broken), only their content shrinks. Compression never makes a
+       message *larger*: content already shorter than its own placeholder
+       marker is left unchanged.
     6. Finally, a hard, deterministic budget (``max_messages`` /
        ``max_chars``) is enforced by dropping whole older, non-protected
        turns (oldest first) until the prepared history fits — or until no
@@ -345,17 +449,26 @@ class ManagedContextStrategy(ContextStrategy):
         }
         protected_idx = recent_idx | error_idx
 
-        # For each tool name, the id() of the single most recent successful
-        # result among non-protected turns — that one message is kept in
-        # full even though its turn is otherwise compressed.
-        latest_by_tool: dict[str, int] = {}
+        # Per-resource retention: for each resource key (which file was
+        # read, which command was run, ...), the position (turn, index) of
+        # the single most recent successful result among non-protected
+        # turns is kept in full. Older results with the same key are
+        # superseded and compressed; results with different keys never
+        # affect each other.
+        keys: dict[tuple[int, int], tuple] = {}
+        labels: dict[tuple[int, int], str] = {}
+        latest_by_key: dict[tuple, tuple[int, int]] = {}
         for i, turn in enumerate(turns):
             if i in protected_idx:
                 continue
-            for m in turn:
+            calls = _pair_tool_calls(turn)
+            for j, m in enumerate(turn):
                 if m.role == "tool" and not _is_error_tool_message(m):
-                    latest_by_tool[m.name or ""] = id(m)
-        preserved_msg_ids = set(latest_by_tool.values())
+                    key, label = _resource_key(m, calls.get(j), (i, j))
+                    keys[(i, j)] = key
+                    labels[(i, j)] = label
+                    latest_by_key[key] = (i, j)
+        preserved_positions = set(latest_by_key.values())
 
         turn_outputs: list[list[Message]] = []
         for i, turn in enumerate(turns):
@@ -363,9 +476,18 @@ class ManagedContextStrategy(ContextStrategy):
                 turn_outputs.append(list(turn))
                 continue
             compressed: list[Message] = []
-            for m in turn:
-                if m.role == "tool" and id(m) not in preserved_msg_ids:
-                    compressed.append(self._compress_tool(m))
+            for j, m in enumerate(turn):
+                if m.role == "tool" and (i, j) in keys:
+                    if (i, j) in preserved_positions:
+                        compressed.append(m)
+                    else:
+                        compressed.append(
+                            self._compress_tool(m, keys[(i, j)], labels[(i, j)])
+                        )
+                elif m.role == "tool":
+                    # Only reachable for an error result, which already
+                    # makes the whole turn protected; kept for safety.
+                    compressed.append(m)
                 elif m.role == "assistant":
                     compressed.append(self._compress_assistant(m))
                 else:
@@ -479,10 +601,33 @@ class ManagedContextStrategy(ContextStrategy):
                 turns.append([m])
         return head, turns
 
-    def _compress_tool(self, message: Message) -> Message:
-        marker = self._TOOL_MARKER.format(
-            name=message.name or "tool", chars=len(message.content)
-        )
+    def _compress_tool(self, message: Message, key: tuple, label: str) -> Message:
+        chars = len(message.content)
+        kind = key[0]
+        if kind == "file":
+            marker = (
+                f"[MANAGED CONTEXT: older read of '{label}' omitted ({chars} chars) "
+                "— superseded by a later read; call read_file again if needed]"
+            )
+        elif kind == "shell":
+            marker = (
+                f"[MANAGED CONTEXT: older output of '{label}' omitted "
+                f"({chars} chars) — a later run exists]"
+            )
+        elif kind == "dir":
+            marker = (
+                f"[MANAGED CONTEXT: older listing of '{label}' omitted "
+                f"({chars} chars) — a later listing exists]"
+            )
+        elif kind == "write":
+            marker = (
+                f"[MANAGED CONTEXT: older {message.name or 'write'} result for "
+                f"'{label}' omitted ({chars} chars) — a later write exists]"
+            )
+        else:  # legacy per-tool-name key
+            marker = self._TOOL_MARKER.format(
+                name=message.name or "tool", chars=chars
+            )
         # Compression must never make content larger — a result already
         # shorter than its own placeholder is left alone (nothing to gain by
         # replacing 8 characters with a 60-character marker).

@@ -27,9 +27,14 @@ class _Scripted(LLMProvider):
 
 
 def _patch_provider(monkeypatch, provider):
-    monkeypatch.setattr(
-        "forge.llm.get_provider", lambda settings_override=None: provider
-    )
+    fake = lambda settings_override=None: provider  # noqa: E731
+    monkeypatch.setattr("forge.llm.get_provider", fake)
+    # These modules bind get_provider at import time; if another test file
+    # imported them first, patching forge.llm alone would leave them on the
+    # REAL provider (real network calls with the developer's API key).
+    monkeypatch.setattr("forge.evaluation.matrix.get_provider", fake)
+    monkeypatch.setattr("forge.evaluation.runner.get_provider", fake)
+    monkeypatch.setattr("forge.agent.get_provider", fake)
 
 
 def test_no_subcommand_prints_help_and_exits_zero(capsys):

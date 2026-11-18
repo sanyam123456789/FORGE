@@ -17,11 +17,11 @@ class TestDefaultSettings:
 
     def test_default_provider(self, clean_env):
         s = load_settings()
-        assert s.llm_provider == "gemini"
+        assert s.llm_provider == "opencode_go"
 
     def test_default_model(self, clean_env):
         s = load_settings()
-        assert s.llm_model == "gemini-3.6-flash"
+        assert s.llm_model == "deepseek-v4.1-flash"
 
     def test_default_temperature(self, clean_env):
         s = load_settings()
@@ -29,7 +29,7 @@ class TestDefaultSettings:
 
     def test_default_max_output_tokens(self, clean_env):
         s = load_settings()
-        assert s.llm_max_output_tokens == 4096
+        assert s.llm_max_output_tokens == 0  # no cap by default
 
     def test_api_key_default_empty(self, clean_env):
         s = load_settings()
@@ -59,13 +59,6 @@ class TestDefaultSettings:
         s = load_settings()
         assert s.provider_order == ()
 
-    def test_groq_cerebras_keys_and_models_empty_by_default(self, clean_env):
-        s = load_settings()
-        assert s.groq_api_key == ""
-        assert s.groq_model == ""
-        assert s.cerebras_api_key == ""
-        assert s.cerebras_model == ""
-
     def test_provider_retry_max_default(self, clean_env):
         s = load_settings()
         assert s.provider_retry_max == 3
@@ -79,9 +72,9 @@ class TestEnvOverrides:
     """load_settings() respects environment variable overrides."""
 
     def test_provider_override(self, clean_env, monkeypatch):
-        monkeypatch.setenv("FORGE_LLM_PROVIDER", "anthropic")
+        monkeypatch.setenv("FORGE_LLM_PROVIDER", "openai_compatible")
         s = load_settings()
-        assert s.llm_provider == "anthropic"
+        assert s.llm_provider == "openai_compatible"
 
     def test_model_override(self, clean_env, monkeypatch):
         monkeypatch.setenv("FORGE_LLM_MODEL", "claude-3-5-sonnet-20241022")
@@ -119,32 +112,20 @@ class TestEnvOverrides:
         assert s.log_dir == Path("my_logs")
 
     def test_llm_api_key_still_works_unchanged(self, clean_env, monkeypatch):
-        """Correction from the user: FORGE_LLM_API_KEY must keep working as
-        the (legacy-named but still primary) Gemini key — no rename
-        required, no FORGE_GEMINI_API_KEY needed."""
-        monkeypatch.setenv("FORGE_LLM_API_KEY", "existing-gemini-key")
+        """FORGE_LLM_API_KEY stays the primary key variable for every
+        provider — no provider-specific rename required."""
+        monkeypatch.setenv("FORGE_LLM_API_KEY", "existing-provider-key")
         s = load_settings()
-        assert s.llm_api_key == "existing-gemini-key"
+        assert s.llm_api_key == "existing-provider-key"
 
     def test_provider_order_parsed_and_lowercased(self, clean_env, monkeypatch):
-        monkeypatch.setenv("FORGE_PROVIDER_ORDER", "Gemini, groq ,CEREBRAS")
+        monkeypatch.setenv("FORGE_PROVIDER_ORDER", "OpenCode_Go, openai_COMPATIBLE ")
         s = load_settings()
-        assert s.provider_order == ("gemini", "groq", "cerebras")
+        assert s.provider_order == ("opencode_go", "openai_compatible")
 
     def test_provider_order_unset_stays_empty(self, clean_env):
         s = load_settings()
         assert s.provider_order == ()
-
-    def test_groq_cerebras_env_overrides(self, clean_env, monkeypatch):
-        monkeypatch.setenv("FORGE_GROQ_API_KEY", "groq-key")
-        monkeypatch.setenv("FORGE_GROQ_MODEL", "llama-3.3-70b-versatile")
-        monkeypatch.setenv("FORGE_CEREBRAS_API_KEY", "cerebras-key")
-        monkeypatch.setenv("FORGE_CEREBRAS_MODEL", "llama3.3-70b")
-        s = load_settings()
-        assert s.groq_api_key == "groq-key"
-        assert s.groq_model == "llama-3.3-70b-versatile"
-        assert s.cerebras_api_key == "cerebras-key"
-        assert s.cerebras_model == "llama3.3-70b"
 
     def test_provider_retry_max_override(self, clean_env, monkeypatch):
         monkeypatch.setenv("FORGE_PROVIDER_RETRY_MAX", "5")
@@ -181,7 +162,7 @@ class TestValidation:
             load_settings()
 
     def test_provider_order_rejects_unknown_provider(self, clean_env, monkeypatch):
-        monkeypatch.setenv("FORGE_PROVIDER_ORDER", "gemini,openai")
+        monkeypatch.setenv("FORGE_PROVIDER_ORDER", "opencode_go,gemini")
         with pytest.raises(ValueError, match="FORGE_PROVIDER_ORDER"):
             load_settings()
 
@@ -204,10 +185,12 @@ class TestNumericBounds:
         with pytest.raises(ValueError, match="minimum"):
             load_settings()
 
-    def test_zero_max_llm_turns_rejected(self, clean_env, monkeypatch):
+    def test_zero_means_unlimited(self, clean_env, monkeypatch):
         monkeypatch.setenv("FORGE_MAX_LLM_TURNS", "0")
-        with pytest.raises(ValueError, match="minimum"):
-            load_settings()
+        monkeypatch.setenv("FORGE_MAX_TOOL_CALLS", "0")
+        monkeypatch.setenv("FORGE_LLM_MAX_OUTPUT_TOKENS", "0")
+        s = load_settings()
+        assert (s.max_llm_turns, s.max_tool_calls, s.llm_max_output_tokens) == (0, 0, 0)
 
     def test_negative_max_output_tokens_rejected(self, clean_env, monkeypatch):
         monkeypatch.setenv("FORGE_LLM_MAX_OUTPUT_TOKENS", "-1")
@@ -251,13 +234,6 @@ class TestSecretRedaction:
         s = load_settings()
         assert "<not set>" in repr(s)
 
-    def test_repr_redacts_groq_and_cerebras_keys(self, clean_env, monkeypatch):
-        monkeypatch.setenv("FORGE_GROQ_API_KEY", "sk-groq-secret")
-        monkeypatch.setenv("FORGE_CEREBRAS_API_KEY", "sk-cerebras-secret")
-        s = load_settings()
-        representation = repr(s)
-        assert "sk-groq-secret" not in representation
-        assert "sk-cerebras-secret" not in representation
 
 
 class TestSettingsImmutability:
