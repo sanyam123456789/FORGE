@@ -16,7 +16,32 @@ prompt stay fixed, so the savings can be measured.
 
 ## Results
 
-<!-- RESULTS -->
+Benchmark run on 2026-11-18: the 10-task suite under six strategy
+combinations, 60 real runs on OpenCode Go (`deepseek-v4.1-flash`).
+
+| Arm | Solved | Avg tokens | Cache hit | Avg LLM calls |
+|---|---:|---:|---:|---:|
+| fixed_raw (baseline) | 10/10 | 7,144 | 76% | 3.8 |
+| adaptive_raw (lean tools) | 10/10 | **5,594** | 73% | 3.4 |
+| fixed_managed | 10/10 | 7,230 | 76% | 3.9 |
+| adaptive_managed | 10/10 | 5,802 | 71% | 3.5 |
+| fixed_stable | 10/10 | 6,988 | 75% | 3.7 |
+| adaptive_stable (`smart`) | 10/10 | 7,252 | 77% | 4.2 |
+
+- **Same results:** every arm solved every task.
+- **Lean tools: 22% fewer tokens** than the baseline (lower on 9 of 10 tasks).
+- **Context strategies: not tested by this suite.** The largest context in
+  any run was about 1k tokens, below every pruning threshold, so raw,
+  managed and stable sent identical requests. Differences between them here
+  are run-to-run noise, which reached 3× on a single task. Measuring them
+  needs longer tasks and repeated runs.
+- **Earlier manual benchmark** (other providers): FORGE used 4–25× fewer
+  tokens than an external agent running the same model, with the same
+  correct output
+  ([details](docs/benchmark-forge-vs-external-agents.md)).
+
+Full tables and caveats: [`docs/step-11-benchmark-results.md`](docs/step-11-benchmark-results.md).
+Reproduce with `forge bench`, then `forge report`.
 
 ## Quick start
 
@@ -212,7 +237,7 @@ pytest            # 659 tests, no API key or network needed
 | 6 | Managed context | [step-06](docs/step-06-managed-context.md) |
 | 7–8 | Formal 2×2 experiment, statistical analysis | [step-07](docs/step-07-controlled-2x2-experiment.md), [step-08](docs/step-08-statistical-analysis.md) |
 | 9 | Real-provider pilots, external-agent benchmark | [step-09](docs/step-09-research-multitask-analysis.md), [benchmark](docs/benchmark-forge-vs-external-agents.md) |
-| 11 | Cache-friendly context, token savers, chat, modes, bench/report | [step-11](docs/step-11-token-savers.md) |
+| 11 | Cache-friendly context, token savers, chat, modes, bench/report | [step-11](docs/step-11-token-savers.md), [results](docs/step-11-benchmark-results.md) |
 
 ## Not included (by design)
 
